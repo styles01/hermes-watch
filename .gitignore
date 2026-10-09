@@ -1,0 +1,17 @@
+# reference clones have their own histories — pinned by SHA in PLAN.md
+reference/
+# build artifacts
+.build/
+*.o
+*.elf
+*.bin
+# local secrets (device tokens etc) — never tracked
+.env
+*.local
+build artifacts:
+.build*/
+__pycache__/
+*.o
+*.elf
+*.bin
+
