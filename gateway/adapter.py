@@ -238,6 +238,24 @@ class GadgetAdapter(BasePlatformAdapter, HubDelegate):
         self._max_utterance_s = float(extra.get("max_utterance_s") or 60)
         self._speak_replies = _flag(extra.get("speak_replies"), True)
         self._auto_home = _flag(extra.get("auto_home"), True)
+        # device id (or device name) → runtime profile that should OWN the device's turns
+        raw_profiles = extra.get("device_profiles") or {}
+        self._device_profiles: Dict[str, str] = {}
+        if isinstance(raw_profiles, dict):
+            for k, v in raw_profiles.items():
+                did, prof = str(k).strip(), str(v).strip()
+                if did and prof:
+                    self._device_profiles[did] = prof
+                    self._device_profiles[did.lower()] = prof
+        # v0.5.10: per-TURN agent routing — the ring's committed agent name → runtime
+        # profile. Only names PRESENT in this map are honored (wire values are not trusted).
+        raw_agents = extra.get("agent_profiles") or {}
+        self._agent_profiles: Dict[str, str] = {}
+        if isinstance(raw_agents, dict):
+            for k, v in raw_agents.items():
+                aname, prof = str(k).strip().lower(), str(v).strip()
+                if aname and prof:
+                    self._agent_profiles[aname] = prof
         self._tls_cert = extra.get("tls_cert")
         self._tls_key = extra.get("tls_key")
         self._access_token = extra_or_secret(extra, "access_token", "GADGET_ACCESS_TOKEN") or None
@@ -450,18 +468,51 @@ class GadgetAdapter(BasePlatformAdapter, HubDelegate):
     # -- inbound --------------------------------------------------------------------
 
     def _source(self, session: DeviceSession):
-        return self.build_source(
+        """SessionSource for a device turn. ``device_profiles`` (platform config) re-homes
+        specific devices to other runtime profiles — the key turns the session into
+        ``agent:<profile>:gadget:dm:<device>`` so the chosen profile's brain answers, not
+        this adapter's owner. Stamping ``source.profile`` before the gateway resolves the
+        identity is authoritative: ``resolve_identity`` only consults profile routes when
+        the source arrives without one. Default = this adapter's owner profile."""
+        # v0.5.13 fix: the hub already proved device identity (HMAC challenge on connect)
+        # and turns only flow for operator-paired sessions. Stamp ``role_authorized`` so
+        # the runner's authz delegation honors the hub's verification *before* the
+        # transport-home pairing/allowlist read. Under per-turn profile routing the routed
+        # identity re-homes authorization reads and the gadget device id sits in no
+        # allowlist there — which silently refused EVERY watch turn after the multiplex
+        # restart ("pairing code" refusals with outcome=success, no agent run).
+        src = self.build_source(
             chat_id=session.device_id, chat_name=session.name, chat_type="dm",
-            user_id=session.device_id, user_name=session.name)
+            user_id=session.device_id, user_name=session.name,
+            role_authorized=bool(getattr(session, "paired", False)))
+        # routing precedence: turn's committed agent (v0.5.10) → device map (v1) → owner
+        turn_agent = str(getattr(session, "turn_agent", "") or "").strip().lower()
+        if getattr(session, "turn_agent", None) and turn_agent not in self._agent_profiles:
+            logger.debug("[%s] turn agent %r not in agent_profiles; falling back to device map",
+                         self.name, turn_agent)
+        routed = (self._agent_profiles.get(turn_agent)
+                  or (self._device_profiles or {}).get(str(session.device_id).strip())
+                  or (self._device_profiles or {}).get(str(getattr(session, "name", "")).strip().lower()))
+        if routed and routed != getattr(self, "_owner_profile", None):
+            src.profile = routed
+            src.profile_route_rejected = False
+        return src
 
     @staticmethod
     def _message_id(session: DeviceSession, msg_id: str) -> str:
         return f"{session.session_id}:{msg_id or uuid.uuid4().hex[:8]}"
 
     def _event(self, session: DeviceSession, msg_id: str, text: str, **kw) -> MessageEvent:
+        # v0.5.15: voice turns on a speaker device are COMMANDS, not essays. Bind the
+        # routed profile's google-home-control skill so NEW gadget sessions auto-load its
+        # SKILL.md (run assist.py via terminal) into the turn context — the prompt alone
+        # was drowned out by persona + essay history (3,655-char spoken essay, zero tool
+        # calls, 2026-10-09 20:07). Core honors event.auto_skill on new sessions only.
+        skills = ["google-home-control"] if getattr(session, "has_speaker", False) else None
         return MessageEvent(
             text=text, source=self._source(session), message_id=self._message_id(session, msg_id),
-            user_id=session.device_id, user_name=session.name, channel_prompt=session.prompt_context(), **kw)
+            user_id=session.device_id, user_name=session.name, channel_prompt=session.prompt_context(),
+            auto_skill=skills, **kw)
 
     async def on_text(self, session: DeviceSession, msg_id: str, text: str) -> None:
         await self.handle_message(self._event(session, msg_id, text, message_type=MessageType.TEXT))
@@ -500,13 +551,18 @@ class GadgetAdapter(BasePlatformAdapter, HubDelegate):
             return
         turn = event.message_id or uuid.uuid4().hex[:12]
         self._turns[session.device_id] = turn
+        session.turn_open = turn  # HUB-1: id in flight (replayed if connection is replaced)
         await session.turn_start(turn)
 
     async def on_processing_complete(self, event: MessageEvent, outcome) -> None:
         session = self._session(event.source.chat_id)
-        if session is None or not session.paired:
+        if session is None:
+            self._turns.pop(event.source.chat_id, None)
             return
-        turn = self._turns.pop(session.device_id, None) or event.message_id or ""
+        turn = event.message_id or ""
+        booked = self._turns.pop(session.device_id, None)
+        if booked is not None and booked != turn:
+            self._turns[session.device_id] = booked
         outcome_value = getattr(outcome, "value", str(outcome))
         if outcome_value == "failure":
             import traceback as _tb
@@ -517,10 +573,12 @@ class GadgetAdapter(BasePlatformAdapter, HubDelegate):
         if outcome_value == "failure" and turn:
             # Graceful failure: the device must never sit silently in THINKING.
             try:
-                await session.send_notice("Turn failed — try again", ttl_s=10)
+                await session.send_notice("Turn failed — try again", ttl_s=10, level="error")
             except Exception:
                 logger.warning("[%s] failure notice could not be sent to %s",
                                self.name, session.device_id, exc_info=True)
+        if session.turn_open == turn:
+            session.turn_open = None  # HUB-1: clear before send
         await session.turn_end(turn, outcome_value)
 
     def set_status_text(self, chat_id: str, text: Optional[str]) -> None:
@@ -637,6 +695,7 @@ class GadgetAdapter(BasePlatformAdapter, HubDelegate):
             # Hermes keeps one confirmation per session: a new one supersedes the last.
             queue[:] = [p for p in queue if not (p.kind == "slash" and p.session_key == prompt.session_key)]
         queue.append(prompt)
+        session.waiting = True  # v0.5.28: parked prompt -> device pauses stall watchdogs
         await self._show_prompt(session)
         return SendResult(success=True, message_id=PROMPT_PREFIX + prompt.id)
 
@@ -644,6 +703,7 @@ class GadgetAdapter(BasePlatformAdapter, HubDelegate):
         """Put the oldest open question on the device (it shows one at a time)."""
         queue = self._prompts.get(session.device_id) or []
         queue[:] = [p for p in queue if not p.expired()]
+        session.waiting = bool(queue)  # flag follows the REAL queue
         if queue:
             head = queue[0]
             await session.ask(head.id, head.title, head.text, ttl_s=head.ttl_s)
@@ -661,11 +721,12 @@ class GadgetAdapter(BasePlatformAdapter, HubDelegate):
         if self._take_prompt(session.device_id, prompt_id) and was_shown:
             await session.close_prompt(prompt_id)
             await self._show_prompt(session)
+        session.waiting = bool(self._prompts.get(session.device_id) or [])
 
     async def on_prompt_reply(self, session: DeviceSession, prompt_id: str, yes: bool) -> None:
         prompt = self._take_prompt(session.device_id, prompt_id)
         if prompt is None or prompt.expired():
-            await session.send_notice("That question has expired")
+            await session.send_notice("That question has expired", level="error")
         elif prompt.kind == "slash":
             await self._answer_slash(session, prompt.session_key, prompt.confirm_id, "once" if yes else "cancel")
         else:
@@ -674,8 +735,8 @@ class GadgetAdapter(BasePlatformAdapter, HubDelegate):
             if resolve_gateway_approval(prompt.session_key, "once" if yes else "deny"):
                 await session.send_notice("Approved" if yes else "Denied")
             else:
-                await session.send_notice("That approval has expired")
-        await self._show_prompt(session)
+                await session.send_notice("That approval has expired", level="error")
+        await self._show_prompt(session)  # flag re-derived inside from the live queue
 
     async def _answer_slash(self, session: DeviceSession, session_key: str, confirm_id: str, choice: str) -> None:
         from tools import slash_confirm
@@ -688,7 +749,7 @@ class GadgetAdapter(BasePlatformAdapter, HubDelegate):
         if result:
             await self.send(session.device_id, result)
         else:
-            await session.send_notice("That question has expired")
+            await session.send_notice("That question has expired", level="error")
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         session = self._session(chat_id)

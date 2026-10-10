@@ -63,6 +63,21 @@ updates itself over the air.
   on the screen.
 - **Voice failure surfaces**: tap-to-stop mid-speech, cancel on touch-hold, playback
   watchdogs both directions (90 s run-on cap, 5 s dead-stream un-stick).
+- **Readable reply cards**: the full answer lands as a paged 8-row card (page
+  B to advance, hold-B on the last page to answer by voice), auto-shown when
+  the audio drains.
+- **Approval cards on the wrist**: agent yes/no questions render as an APPROVAL
+  card — **A YES / B NO / hold-B "later"** (re-raises in 45 s); the answer
+  routes back to the agent instantly.
+- **Waiting-on-user state**: while the agent waits on the watch's answer, the
+  ring pulses magenta and the watchdogs stand down — a parked decision never
+  looks like a stall.
+- **Tool-progress ticker**: the agent's live status ("WORKING 12s") paints
+  under the disc at 1 Hz; transcript echoes ("YOU: …") show the moment your
+  words are transcribed.
+- **Honest stop/failure feedback**: STOPPED on tap-to-stop, red-band error
+  notices (server `level`), thinking-face for streaming text (not a fake
+  listening state).
 - **Over-the-air updates**: HMAC-signed offers streamed in 4 KB chunks with streamed
   SHA-256 verification, rollback probation, and a version tag burned into the image.
 
@@ -75,7 +90,7 @@ firmware/libs/           vendored MIT libs: M5IOE1 (IO/expander), M5PM1 (power m
 sim/                     desktop SDL simulator of the device (same engine, same UI code)
 gateway/                 the hub half: a Hermes "gadget" platform plugin (MIT) — device
                          hub, auth/pairing, audio pacing, TTS delivery, OTA queue, CLI
-docs/                    build, protocol, OTA docs
+docs/                    build, protocol, OTA, server-side setup docs
 ```
 
 ## Build & flash
@@ -97,13 +112,19 @@ First flash goes over USB (app + partition table + bootloader); after that every
 ships over WiFi — see [OTA](#over-the-air-updates). The desktop simulator builds with
 `sim/build.sh` (needs SDL2 + M5GFX; see [sim/BUILD.md](sim/BUILD.md)).
 
-## Gateway
+## Gateway & server-side setup
 
-`gateway/` is a Hermes platform plugin: devices enroll with a per-device HMAC key, pass a
-pairing flow, then trade `hg.v1` JSON frames + binary PCM over one WebSocket. It owns
-heartbeats, audio pacing (jitter-aware playback pump), prompt/notice routing, and the
-OTA queue the device's bootloader trusts. Install as a Hermes plugin —
-[docs/GATEWAY.md](docs/GATEWAY.md) covers pairing, config and the CLI.
+The **entire server side lives in this repo**: `gateway/` is a Hermes platform plugin —
+devices enroll with a per-device HMAC key, pass a pairing flow, then trade `hg.v1` JSON
+frames + binary PCM over one WebSocket. It owns heartbeats, audio pacing (jitter-aware
+playback pump), prompt/notice routing, and the OTA queue the device's bootloader trusts.
+
+**Everything you need to make a watch actually work against your own Hermes:**
+[docs/SERVER-SETUP.md](docs/SERVER-SETUP.md) — plugin install, the exact config.yaml
+block (device/agent profile routing + the toolset binding that gives the brain hands),
+pairing, STT/TTS prerequisites, optional env keys, and the Google Home helper
+(`GOOGLE_HOME_CMD`) behind the "hey watch, turn off the coffee machine" demo.
+Pairing + CLI details: [docs/GATEWAY.md](docs/GATEWAY.md).
 
 Protocol reference: [docs/PROTOCOL.md](docs/PROTOCOL.md) (frames, channels, auth).
 Gateway-side integration lessons (TTS/STT/auth/watchdogs): [docs/GATEWAY-LEARNINGS.md](docs/GATEWAY-LEARNINGS.md).
@@ -117,10 +138,13 @@ the image once it's reached the hub (automatic rollback otherwise). [docs/OTA.md
 
 ## Status
 
-v1.0.0 — device firmware v0.5.9, running daily on real hardware: paired, voice E2E, four
-OTAs over WiFi, idle-ring/tap-face/commands screen shipped. Voice pipeline hardening
-(progress speak-through, spoken approvals) is on the v2 map (ideas from
-[jarvis-desk-bot](https://github.com/dreamhunter02/jarvis-desk-bot) — see credits).
+**v1.1.0 — device firmware v0.5.29**, running daily on real hardware: paired, voice E2E
+(PTT → STT → agent → TTS), real smart-home actions executed by voice (Google Home),
+approval cards, reply cards, tool ticker, OTA self-updates. In active development;
+visual polish of the card UX is the current lane.
+
+Grab the prebuilt binary on the [Releases](../../releases) page (v1.1.0 ships the
+v0.5.29 app image — OTA or USB both work; see [docs/OTA.md](docs/OTA.md)).
 
 ## Credits
 

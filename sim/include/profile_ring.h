@@ -24,7 +24,7 @@ namespace prof {
 // Profile set v1. Names are generic by default; rename to your agents here.
 constexpr size_t kProfileCount = 5;
 constexpr const char* kProfileNames[kProfileCount] = {
-    "agent 1", "agent 2", "agent 3", "agent 4", "agent 5",
+    "mais", "oracle", "lara", "loca", "venus",
 };
 // Agent-state dot colors (idle=grey, listening=amber, thinking=blue,
 // speaking=green) — driven by bridge events in Phase 3; static here.

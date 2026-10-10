@@ -20,7 +20,10 @@ constexpr uint16_t kEyeColor = TFT_WHITE;
 constexpr uint16_t kEyeEdgeColor = 0x738E;
 constexpr float kTouchTravelX = 70.0f;
 constexpr float kTouchTravelY = 56.0f;
-constexpr float kTiltTravelX = 112.0f;
+// v0.5.17 (review F4): 112 px tilt reach put eye ink past the ring erase band (r203)
+// during LISTENING/THINKING/SPEAKING — per-frame dirty-rect erase punched ring holes.
+// 82 px keeps worst-case tilt reach ~200 px < 203 (review-simulated).
+constexpr float kTiltTravelX = 82.0f;
 constexpr float kTiltTravelY = 92.0f;
 constexpr float kTiltLeadTravelX = 34.0f;
 constexpr float kTiltLeadTravelY = 28.0f;

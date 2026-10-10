@@ -61,6 +61,7 @@ struct VoiceHooks {
   size_t (*sendBin)(const uint8_t *, size_t);
   const char *(*agentTag)();                      // v0.5.10: committed agent (lowercase), routed hub-side
   void   (*playbackIdle)();                       // v0.5.14: TTS finished → restore idle face/ring/status
+  void   (*xlog)(const char *, const char *);     // v0.5.23: log-only device→hub diag frame
 };
 static VoiceHooks VH = {};  // sketch fills these in setup()
 
@@ -73,6 +74,9 @@ static inline bool voiceAllocBuffers() {
 }
 
 static inline void voicePlaybackReset() {
+  // v0.5.24 diag: WHO reset the playback? (caller-typed at call sites below via
+  // this macro-free tag; hub-side INFO log makes it visible without serial)
+  if (VH.xlog) VH.xlog("reset", "voicePlaybackReset entered");
   V.rTail = V.rHead = V.rUsed = 0;
   V.playStream = 0;
   V.playSeqExpected = 0;
@@ -117,7 +121,20 @@ static void voiceOnBinary(const uint8_t *p, size_t len) {
   const uint16_t stream = p[1];
   const uint16_t seq = static_cast<uint16_t>(p[2] | (p[3] << 8));
   if (ch == 0x03) { Ota::onBinary(p, len); return; }   // v0.5.4: firmware frames
-  if (ch != 0x01 || !V.playStream || stream != V.playStream) return;  // ignore foreign
+  if (VH.xlog) {  // v0.5.23 diag: binary-frame gate truth (1/s throttle)
+    static uint32_t s_bdiagMs = 0;
+    const bool accept = (ch == 0x01 && V.playStream && stream == V.playStream);
+    if (millis() - s_bdiagMs > 1000) {
+      s_bdiagMs = millis();
+      char det[96];
+      if (ch != 0x01)          snprintf(det, sizeof(det), "ch=0x%02x len=%u REFUSE:channel", ch, (unsigned)len);
+      else if (!V.playStream)  snprintf(det, sizeof(det), "stream=%u len=%u REFUSE:no-playStream", stream, (unsigned)len);
+      else if (stream != V.playStream) snprintf(det, sizeof(det), "stream=%u play=%u REFUSE:mismatch", stream, (unsigned)V.playStream);
+      else                     snprintf(det, sizeof(det), "stream=%u len=%u ACCEPT", stream, (unsigned)len);
+      det[sizeof(det)-1] = 0;
+      VH.xlog("pcm", det);
+    }
+  }
   if (V.playFirst) {
     V.playFirst = false;
     V.playSeqExpected = seq;
@@ -136,11 +153,41 @@ static void voiceOnBinary(const uint8_t *p, size_t len) {
 // data must remain valid until played → static rotating blocks.
 // Feed ≤ 2 × 20 ms per loop to bound the loop stall.
 static void voiceSpeakerPump() {
+  // v0.5.22: PLAYBACK DRAIN-STALL hard watchdog (mirror of v0.5.13 mic-stall).
+  // If the ring holds data but the pump cursor hasn't advanced for 30 s, the I2S/
+  // DAC side is wedged — a full turn can never drain on its own (observed: the
+  // 23:01 turn wedged the watch in orange THINKING for good). Recover HARD:
+  // stop the speaker, reset playback, re-enter idle. One glitched replay beats a
+  // dead watch.
+  {
+    static size_t   s_lastDrainUsed = SIZE_MAX;
+    static uint32_t s_drainStallMs  = 0;
+    if (V.playStream && V.rUsed > 0) {
+      if (V.rUsed != s_lastDrainUsed) {            // cursor moved — healthy
+        s_lastDrainUsed = V.rUsed;
+        s_drainStallMs  = millis();
+      } else if (s_drainStallMs && millis() - s_drainStallMs > 30000) {
+        if (VH.xlog) VH.xlog("drain-stall", "fired 30s frozen");
+        Serial.printf("[voice] DRAIN STALL: rUsed=%u frozen 30 s — hard audio reset\n",
+                      (unsigned)V.rUsed);
+        M5.Speaker.end();
+        voicePlaybackReset();
+        s_lastDrainUsed = SIZE_MAX;
+        s_drainStallMs  = 0;
+        if (VH.playbackIdle) VH.playbackIdle();
+      }
+    } else {
+      s_lastDrainUsed = SIZE_MAX;
+      s_drainStallMs  = 0;
+    }
+  }
+
   // v0.5.15 CRITICAL: the done-gate must run BEFORE the empty-ring early return —
   // a fast speaker drains rUsed to 0 within moments of audio.end, the old order then
   // returned here forever and the playback state (blue ring) NEVER released → the
   // "blue ring of death" (playStream stuck, mic gated, screen blue).
   if (V.playEnded && V.rUsed == 0 && V.playStream) {
+    if (VH.xlog) VH.xlog("done-gate", "fired");
     Serial.printf("[voice] playback done: %u B seqgaps=%u\n",
                   (unsigned)V.playBytes, (unsigned)V.playSeqGaps);
     M5.Speaker.stop();
@@ -175,16 +222,22 @@ static void voiceSpeakerPump() {
   // forever; the "done" gate (rUsed == 0) was unreachable, the device stayed in
   // SPEAKING and the 90 s watchdog drew PLAYBACK STOPPED a minute later. Zero-pad
   // the tail, play it, and the drain completes within ~40 ms of audio.end.
-  if (V.playEnded && V.rUsed > 0 && V.playStream && !V.speakerDrainFlush) {
+  if (V.playEnded && V.rUsed > 0 && V.playStream) {
+    // v0.5.25 TAIL-DRAIN FIX: audio.end lands mid-frame; the old one-shot drained
+    // at most ONE 640-B block per stream and could strand 161..639 B in the ring
+    // forever — the done-gate (rUsed==0) starved and the 30 s drain-stall hard
+    // reset fired half a minute after every voice (23:47 trace). Drain ONE
+    // zero-padded ≤640-B chunk per pass; the loop re-enters until the ring is
+    // empty, then the done-gate releases the state immediately.
     static int16_t tailPool[320];
     memset(tailPool, 0, sizeof(tailPool));
     size_t n = 0;
     while (V.rUsed > 0 && n < 320) {
-      tailPool[n++] = (int16_t)((V.ring[V.rTail] << 8) | V.ring[(V.rTail + 1) % kPlayRingBytes]);
+      tailPool[n++] = (int16_t)((uint16_t)V.ring[V.rTail] | ((uint16_t)V.ring[(V.rTail + 1) % kPlayRingBytes] << 8));  // v0.5.27: LE, same packing as the main pump path (reviewer P3)
       V.rTail = (V.rTail + 2) % kPlayRingBytes;
       V.rUsed = (V.rUsed >= 2) ? V.rUsed - 2 : 0;
     }
-    V.speakerDrainFlush = true;
+    if (V.rUsed == 0) V.speakerDrainFlush = true;   // final padded chunk marked
     M5.Speaker.playRaw(tailPool, (size_t)((n + 1) & ~1), kVoiceRate, false, 1, 0);
   }
   // (done-gate moved to pump head, v0.5.15 — see comment there)

@@ -57,12 +57,42 @@ static bool s_enrolled = false;         // last-known server truth
 __attribute__((used, section(".rodata")))
 static const char HG_BOARD_TAG[] = "HGBOARD=m5stack-stopwatch";
 __attribute__((used, section(".rodata")))
-static const char HG_VER_TAG[] = "HGVER=0.5.16";
+static const char HG_VER_TAG[] = "HGVER=0.5.29";
 static bool s_connected = false;
 static bool s_paired = false;
-static bool s_turnActive = false;       // reply streaming in progress
+static bool s_turnActive = false;
+static uint32_t s_turnStartMs = 0;   // v0.5.19: wall-clock turn floor (orphan bound)       // reply streaming in progress
 static bool s_hasLiveStatus = false;
 static bool s_deltaLive = false;   // delta strip currently painted
+// v0.5.17: set when a delta strip paint/erase was suppressed (toast/static screen)
+// so the band can be repainted when the eyes screen returns.
+static bool s_deltaDirty = false;
+// ---- v0.5.28 prompt card / reply card / waiting-on-user / status ticker ----
+static bool s_hubWaiting = false;  // prompt parked (or status.waiting): watchdogs exempt
+static char s_promptId[40] = "";
+static char s_promptTitle[56] = "";
+static char s_promptText[160] = "";
+static bool s_promptOpen = false;
+static bool s_promptCardPainted = false;
+static bool s_promptPending = false;  // "later": hidden, re-raises on a timer
+static uint32_t s_promptRaiseMs = 0;
+static uint32_t s_promptExpireMs = 0;  // 0 = no ttl on the wire
+static uint32_t s_promptTtlMs = 0;
+static bool s_promptHoldLatched = false;
+static char s_statusText[44] = "";  // tool-progress ticker text
+static bool s_tickerLive = false;  // ticker painted on y=318 right now
+static bool s_tickerDirty = false;  // repaint when the eyes screen owns the panel
+static char s_replyText[448];
+static size_t s_replyLen = 0;
+static bool s_replyAutoPending = false;  // the card shows after the audio drains
+static bool s_replyCardShown = false;
+static bool s_replyCardPainted = false;
+static bool s_promptRepaint = false;   // v0.5.29: card repaints ONLY on change
+static bool s_replyRepaint = false;    // (was: full card redraw EVERY loop pass
+                                       //  -> SPI traffic starved the ring <24fps)
+static uint8_t s_replyPage = 0;
+static uint32_t s_replyCardUntilMs = 0;
+static bool s_replyHoldLatched = false;
 
 // Avatar state mapping (DESIGN-LOCKED Layer 2):
 //   listening  = mic open / PTT held          -> ExpressionId::Listening
@@ -73,6 +103,8 @@ static bool s_pttStartSerial = false;    // serial 'T' one-shot
 static bool s_pttStopSerial = false;
 static uint32_t s_lastServerPollMs = 0;
 static uint32_t s_reconnectAtMs = 0;
+static uint32_t s_lastServerFrameMs = 0;  // v0.5.27 read-idle watchdog: ANY hub frame
+static uint32_t s_lastTurnFrameMs = 0;    // v0.5.27 turn-stuck watchdog: turn-ish frames only
 
 WsRawClient s_ws;
 
@@ -97,6 +129,7 @@ AvatarEngine avatar;
 bool s_diagMode = false;
 bool s_diagLatched = false;
 bool s_diagPainted = false;  // H3: diag view currently on the panel
+bool s_diagPending = false;  // v0.5.17 (F8): toggled ON during a toast; paint at expiry
 
 // ------------------------------------------------------------- helpers ----
 
@@ -115,7 +148,7 @@ void sendText(const String &line) {
 void sendJson(const char *type, const char *extraJson = nullptr) {
   char buf[192];
   if (extraJson && extraJson[0]) {
-    snprintf(buf, sizeof(buf), "{\"type\":\"%s\",%s}", type, extraJson);
+  snprintf(buf, sizeof(buf), "{\"type\":\"%s\",%s\"}", type, extraJson);
   } else {
     snprintf(buf, sizeof(buf), "{\"type\":\"%s\"}", type);
   }
@@ -279,6 +312,13 @@ static int  s_deltaLen;
 
 static void deltaClear(void) { s_deltaLen = 0; s_deltaTail[0] = 0; }
 
+// v0.5.17 (review F2): the strip's caps-25/26 tails measure up to ~293 px (x 86..380) and
+// descenders reach row 385; the old 266x17 rect guaranteed ghost columns + descender rows.
+// Erase the full text cell, chord-safe (row 385 half-chord ~175 => x 58..408).
+static void eraseDeltaStrip() {
+  M5.Display.fillRect(80, 367, 306, 19, TFT_BLACK);   // rows 367..385, x 80..385
+}
+
 static void deltaPushC(uint8_t c) {
   if (s_deltaLen < 26) s_deltaTail[s_deltaLen++] = (char)c;
   else {
@@ -306,6 +346,9 @@ static ExpressionId s_idleFace = ExpressionId::Idle;  // tap-cycled base face (t
 static void faceHold(ExpressionId expr);  // fwd decl (v0.5.11: defined with the face cycle)
 static void voiceReturnToIdle();          // v0.5.14: idle restore for watchdog paths
 static void eraseStatusLine();            // v0.5.14: clear the y=40 status band
+static void teardownTicker();             // v0.5.28 (defined after the screen globals)
+static void drawTicker(uint32_t nowMs);   // v0.5.28
+static void answerPrompt(bool yes);       // v0.5.28 (defined with the prompt card)
 
 ExpressionId nextIdleFace(ExpressionId cur) {
   return cur == ExpressionId::Idle       ? ExpressionId::Listening :
@@ -316,11 +359,36 @@ ExpressionId nextIdleFace(ExpressionId cur) {
 void setStateFromServer(const char *kind) {
   // Map an hg.v1 event to a KK expression (Layer 2 mapping).
   if (!strcmp(kind, "turn.start"))       avatar.show(ExpressionId::Thinking, millis(), false);
-  else if (!strcmp(kind, "reply.delta")) avatar.show(ExpressionId::Listening, millis(), false);
+  else if (!strcmp(kind, "reply.delta")) avatar.show(ExpressionId::Thinking, millis(), false);
+  // v0.5.28: streaming text is NOT listening — the ears open ONLY for the mic
+  // (the old Listening face under a THINKING ring while TTS spoke read as a lie).
   else if (!strcmp(kind, "turn.end"))    faceHold(s_idleFace);  // v0.5.11: hold any face
 }
 
+
+// v0.5.22: device-to-hub diagnostics over a routed, log-only frame (notify=false ->
+// adapter logs INFO, no turn spawned). Watch USB is power-only on the dock, so the
+// WS is the only telemetry path.
+static void hubXlog(const char *name, const char *detail) {
+  if (!s_connected) return;
+  char xlog[224];
+  snprintf(xlog, sizeof(xlog),
+           "{\"type\":\"event\",\"name\":\"%s\",\"data\":\"%s\",\"notify\":false}",
+           name, detail ? detail : "");
+  sendText(String(xlog));
+}
+
+static void drawStatusLineCol(const char *txt, uint32_t col) {
+  // v0.5.28: level-coded notices + the transcript echo share the band cell.
+  M5.Display.fillRect(20, 38, 440, 20, TFT_BLACK);
+  uiText(txt, 40, &fonts::FreeSans9pt7b, col, TFT_BLACK);
+}
+
 void drawStatusLine(const char *txt) {
+  // v0.5.17 (F5/F7): erase the previous line's full cell (9pt ink rows 41..57 incl
+  // descenders) so every shorter successor leaves no ghost; face-tap cycling showed
+  // 33 px/side residue between names.
+  M5.Display.fillRect(20, 38, 440, 20, TFT_BLACK);
   // L2: circle-safe state banner — text only, no fillRect bleed into the
   // dead corners. v0.5.1: TRUE FreeSans9pt7b base font at scale 1 (was 9pt +
   // sizes 2/4 from callers); y=40 keeps the band inside the top chord (rows
@@ -332,7 +400,7 @@ void drawStatusLine(const char *txt) {
 
 // v0.5.14: erase the y=40 status band (FreeSans9pt7b, ~18 px at scale 1).
 static void eraseStatusLine() {
-  M5.Display.fillRect(20, 38, 440, 18, TFT_BLACK);
+  M5.Display.fillRect(20, 38, 440, 20, TFT_BLACK);   // v0.5.17 (F7): rows 38..57 incl descenders
 }
 
 // -------------------------------------------------- serial control line ----
@@ -444,6 +512,72 @@ static uint32_t s_btnBSuppressMs = 0;          // block PTT re-arm after a
                                                // hold crossed a screen exit
 static uint32_t s_toastUntilMs = 0;            // commit-toast window (H1)
 static bool s_toastShown = false;
+static bool s_cmdArmed = false;  // v0.5.28: 800 ms hold ARMED a two-hold confirm
+// ---- v0.5.28: tool-progress ticker (y=318 band; the jarvis 0.8s-feedback win).
+static void eraseTickerCell() { M5.Display.fillRect(48, 315, 370, 22, TFT_BLACK); }
+
+static void drawTicker(uint32_t nowMs) {
+  if (s_screen != SCR_EYES || s_diagMode ||
+      s_promptCardPainted || s_replyCardPainted || s_toastShown) {
+    s_tickerDirty = s_statusText[0] != 0 || (s_turnActive && !s_statusText[0]);
+    return;
+  }
+  char line[44];
+  if (s_statusText[0]) {
+    strlcpy(line, s_statusText, sizeof(line));
+  } else if (s_turnActive && s_turnStartMs) {
+    snprintf(line, sizeof(line), "WORKING %lus",
+             (unsigned long)((nowMs - s_turnStartMs) / 1000u));
+  } else {
+    line[0] = 0;
+  }
+  eraseTickerCell();
+  if (line[0]) uiText(line, 318, &fonts::FreeSans9pt7b, 0x5A6470u, TFT_BLACK);
+  s_tickerLive = line[0] != 0;
+  s_tickerDirty = false;
+}
+
+static void teardownTicker() {
+  s_statusText[0] = 0;
+  if (s_screen == SCR_EYES && !s_promptCardPainted && !s_replyCardPainted &&
+      !s_toastShown && s_tickerLive) {
+    eraseTickerCell();
+  }
+  s_tickerLive = false;
+  s_tickerDirty = false;
+}
+
+// v0.5.28: extract a JSON string value with real unescaping (\n \" \\ \uXXXX)
+// into dst. Call on the RAW rx — the compacted buf strips spaces INSIDE strings.
+static int jsonExtractString(const char *src, const char *keyWithQuote,
+                             char *dst, size_t dstCap) {
+  const char *t = strstr(src, keyWithQuote);
+  if (!t) return -1;
+  t += strlen(keyWithQuote);
+  size_t o = 0;
+  for (; *t && *t != '"'; ++t) {
+    char c = *t;
+    if (c == '\\' && t[1]) {
+      ++t;
+      char e = *t;
+      if (e == 'n' || e == 'r' || e == 't') c = ' ';
+      else if (e == '"') c = '"';
+      else if (e == '\\') c = '\\';
+      else if (e == '/') c = '/';
+      else if (e == 'u') {
+        // non-ASCII: fonts are ASCII-only — fold to one space, swallow 4 hex
+        if (isxdigit((unsigned char)t[1]) && isxdigit((unsigned char)t[2]) &&
+            isxdigit((unsigned char)t[3]) && isxdigit((unsigned char)t[4])) t += 4;
+        c = ' ';
+      } else c = e;
+    } else if ((unsigned char)c > 0x7E) {
+      c = '?';   // UTF-8 lead byte: one placeholder, do not stop
+    }
+    if (o + 1 < dstCap) dst[o++] = c; else break;
+  }
+  dst[o] = 0;
+  return (int)o;
+}
 
 // ---- v0.5.11 idle-face memory: tap cycles ALL TWELVE expressions ----
 // The three persistent faces (Idle/LISTENING/THINKING = capsule / angled+tilted /
@@ -477,11 +611,13 @@ enum RingState : uint8_t {
   RING_PULSE,      // LISTENING: bright pulsing ring
   RING_THINKING,   // dim ring + rotating 70 deg segment
   RING_SPEAKING,   // TTS playing: slow breathing ring
+  RING_WAITING,    // v0.5.28: prompt parked hub-side — slow magenta pulse
 };
 static constexpr uint8_t kRingRedrawAll = 0xFF;  // force a ring repaint
 static uint8_t s_ringState = kRingRedrawAll;     // last ring drawn
 static uint8_t s_ringBucket = 0xFF;              // brightness/rotation step
 static uint32_t s_lastRingMs = 0;                // >=100 ms redraw guard
+static uint32_t s_lastTickerSec = 0xFFFFFFFFu;   // v0.5.29: 1 Hz ticker gate
 static uint32_t s_clearStatusAtMs = 0;           // v0.5.14: idle status-band erase timer
 
 // v0.5.14: return the eyes screen to TRUE idle — black disc ring band, no stale
@@ -489,8 +625,20 @@ static uint32_t s_clearStatusAtMs = 0;           // v0.5.14: idle status-band er
 // 'playback stopped' text"). Called from every voice watchdog + playback-done path.
 static void voiceReturnToIdle() {
   faceHold(s_idleFace);            // re-commit resting face (draws its label once)
+  teardownTicker();                // v0.5.28: the turn's ticker goes idle with it
   s_clearStatusAtMs = millis() + 1200;   // then erase the band → idle is black
   s_ringState = kRingRedrawAll;    // idle entry erases the annulus arc (fix below)
+  // v0.5.28: the text answer arrived and playback just finished — surface the
+  // readable reply card now (auto-dismisses after 12 s unless answered/paged).
+  if (s_replyAutoPending && s_replyLen && !s_promptOpen) {
+    s_replyAutoPending = false;
+    s_replyCardShown = true;
+    s_replyCardPainted = false;
+    s_replyRepaint = true;   // v0.5.29: auto-show paints once
+    s_replyPage = 0;
+    s_replyCardUntilMs = millis() + 12000;
+    hubXlog("reply-card", "shown");
+  }
 }
 static void cycleIdleFace() {
   faceHold(faceFromIdx((uint8_t)((idleFaceIdx() + 1u) % 12u)));
@@ -556,13 +704,27 @@ void handleProductTouch(uint32_t nowMs) {
   // Reasoning states: TTS playing, server turn active, or mic open. The avatar
   // poke (setTouchTarget) only fires on IDLE taps so play never masks petting.
   if (t.wasPressed()) {
+    if (s_promptCardPainted) {   // v0.5.28: a tap on the card = NO (the card owns
+      hubXlog("prompt-tap", "answered no");  // input; touch-hold cancel is
+      answerPrompt(false);                   // suppressed while it shows)
+      return;
+    }
     const bool busy =
         V.playStream != 0 || s_turnActive || V.micOpen;
     if (busy) {
+      hubXlog("tapped", "tap-to-stop");
       Serial.println("[ui] tap-to-stop speech");
       if (V.micOpen) voiceStopListening();       // close + send audio.end
       else            M5.Speaker.stop();         // instant local mute
       voicePlaybackReset();                      // drop buffered TTS frames
+      teardownTicker();                          // v0.5.28: dead turn's ticker goes
+      drawStatusLineCol("STOPPED", 0xFFB300u);   // v0.5.28: the tap must register
+      s_clearStatusAtMs = millis() + 1500;
+      // v0.5.17 (F9): the turn is being aborted locally — don't leave the ring
+      // asserting THINKING until the hub answers the cancel
+      s_turnActive = false;
+      s_hasLiveStatus = false;
+      setStateFromServer("turn.end");
       avatar.show(ExpressionId::Idle, millis(), false);
       sendText(String("{\"type\":\"cancel\"}")); // hub: abort stream + /stop
       return;                                    // tap consumed
@@ -580,7 +742,7 @@ void handleProductTouch(uint32_t nowMs) {
     // suppressed during toasts / diagnostics like petting above.
     if (t.wasClicked() && t.getClickCount() == 1 && s_screen == SCR_EYES &&
         !s_diagMode && !s_toastShown && !s_turnActive && V.playStream == 0 &&
-        !V.micOpen) {
+        !s_promptCardPainted && !s_replyCardShown && !V.micOpen) {
       cycleIdleFace();
     }
   }
@@ -613,11 +775,11 @@ struct AgentProfile {
 // generic here (AGENT 1..5); rename to your own agent identities at this one table
 // (and mirror in sim/include/profile_ring.h).
 static const AgentProfile kProfiles[] = {
-  {"MAIS",   "",                          0xFFB020u},
-  {"ORACLE", "Foresight Strategist",      0x9D6BFFu},
-  {"LARA",   "Project Engineer",          0x2DD4BFu},
-  {"LOCA",   "Local Model Agent",         0x4ADE80u},
-  {"VENUS",  "Product Research",          0xFF5C8Au},
+  {"AGENT 1", "",                          0xFFB020u},
+  {"AGENT 2", "Foresight Strategist",      0x9D6BFFu},
+  {"AGENT 3", "Project Engineer",          0x2DD4BFu},
+  {"AGENT 4", "Local Model Agent",         0x4ADE80u},
+  {"AGENT 5", "Product Research",          0xFF5C8Au},
 };
 static const size_t kProfileCount = sizeof(kProfiles) / sizeof(kProfiles[0]);
 static size_t s_profileIdx = 4;  // committed agent (default AGENT 5)
@@ -674,6 +836,7 @@ static void saveVolumeIfDirty() {
 
 // ---- eyes-screen circular status ring --------------------------------------
 static const char *turnStateName() {
+  if (s_hubWaiting || s_promptOpen) return "WAITING-ON-USER";
   if (V.micOpen) return "LISTENING";
   if (s_turnActive) return "THINKING";
   return "IDLE";
@@ -690,6 +853,7 @@ static void drawRingFor(const char *stateName, uint32_t nowMs) {
   uint8_t state;
   if (!strcmp(stateName, "LISTENING"))     state = RING_PULSE;
   else if (!strcmp(stateName, "THINKING")) state = RING_THINKING;
+  else if (!strcmp(stateName, "WAITING-ON-USER")) state = RING_WAITING;
   else if (V.playStream)                   state = RING_SPEAKING;
   else                                     state = RING_IDLE;
 
@@ -697,6 +861,7 @@ static void drawRingFor(const char *stateName, uint32_t nowMs) {
   if (state == RING_PULSE)         bucket = (uint8_t)((nowMs / 100) % 10);
   else if (state == RING_THINKING) bucket = (uint8_t)((nowMs / 100) % 10);
   else if (state == RING_SPEAKING) bucket = (uint8_t)(nowMs / 100);
+  else if (state == RING_WAITING)  bucket = (uint8_t)((nowMs / 250) % 8);
 
   const bool force = (s_ringState == kRingRedrawAll);
   if (!force) {
@@ -722,6 +887,7 @@ static void drawRingFor(const char *stateName, uint32_t nowMs) {
       state == RING_PULSE     ? 0x00C853u :   // listening  = green
       state == RING_THINKING  ? 0xFFB300u :   // thinking   = amber
       state == RING_SPEAKING  ? 0x1E88E5u :   // speaking   = blue
+      state == RING_WAITING   ? 0xD840BFu :   // waiting    = magenta (≠ AGENT 1 0xFFB020)
       committedProfile().color;               // idle       = profile color
   // State word at y=340 (rows 341..354, min half-chord 199 px; worst label
   // 'LISTENING' ~90 px): paint once per state change, erase with a black
@@ -735,17 +901,20 @@ static void drawRingFor(const char *stateName, uint32_t nowMs) {
     if (s_labelShown != RING_IDLE) {
       d.fillRect(93, 339, 280, 17, TFT_BLACK);  // chord at y~356: half 197 px
       // v0.5.14: erase the arc too — SPEAKING/THINKING drew 205..230; leaving it
-      // strayed a stale blue/amber ring on screen ("blue ring hang", James).
+      // strayed a stale blue/amber ring on screen ("blue ring hang", user report).
       d.drawArc(kCircleC, kCircleC, 203, 232, 0, 360, TFT_BLACK);
       d.fillRect(20, 38, 440, 18, TFT_BLACK);   // status band (y=40 text) clear
       s_labelShown = RING_IDLE;
     }
-  } else if (!s_toastShown && (s_labelShown != state || force)) {
+  } else if (!s_toastShown && !s_promptCardPainted && !s_replyCardPainted &&
+             (s_labelShown != state || force)) {
     // toast branch: skip the label — the band (dist 106..123 from center)
     // sits inside the toast disc (r140) and would collide with its art.
+    // v0.5.28: cards own the panel — the label waits for them, same rule.
     d.fillRect(93, 339, 280, 17, TFT_BLACK);
     drawLabel(state == RING_PULSE     ? "PUSH-TO-TALK" :
               state == RING_THINKING  ? "THINKING" :
+              state == RING_WAITING   ? "QUESTION - A YES B NO" :
                                         "PLAYING", base);
   }
 
@@ -768,6 +937,12 @@ static void drawRingFor(const char *stateName, uint32_t nowMs) {
       // ~1 Hz breathing (bucket-quantized at 100 ms)
       const float k = 0.45f + 0.275f *
           (1.0f + sinf((float)(nowMs % 1000) * 0.0062832f));
+      d.drawArc(kCircleC, kCircleC, 210, 228, 0, 360, scaleColor24(base, k));
+      break;
+    }
+    case RING_WAITING: {  // v0.5.28: slow magenta pulse — "I need you"
+      const float k = 0.55f + 0.30f *
+          (1.0f + sinf((float)s_ringBucket * 0.6283f));
       d.drawArc(kCircleC, kCircleC, 210, 228, 0, 360, scaleColor24(base, k));
       break;
     }
@@ -796,6 +971,143 @@ static void drawCommitToast() {
   // fits with >126px/side.
   uiText(p.name, 176, &fonts::FreeSansBold24pt7b, p.color, 0x0A0A12u);
   uiText("COMMITTED", 262, &fonts::FreeSans9pt7b, 0x9AA3ADu, 0x0A0A12u);
+}
+// ---- v0.5.28: PROMPT CARD — the hub's yes/no approval question. Wire exists:
+// prompt{id,title,text,ttl_s} → card → prompt.reply → hub resolves the asker.
+static constexpr uint32_t kPromptCol = 0xD840BFu;  // waiting magenta
+
+static void promptTeardown(const char *why) {
+  hubXlog("prompt", why);
+  s_promptId[0] = 0; s_promptTitle[0] = 0; s_promptText[0] = 0;
+  s_promptOpen = false; s_promptCardPainted = false; s_promptPending = false;
+  s_promptRepaint = false; s_replyRepaint = false;
+  s_hubWaiting = false; s_promptExpireMs = 0; s_promptTtlMs = 0;
+  s_promptHoldLatched = false;
+  if (s_screen == SCR_EYES) {
+    M5.Display.fillCircle(kCircleC, kCircleC, kCircleR, TFT_BLACK);
+    avatar.invalidate();
+    s_ringState = kRingRedrawAll;
+  } else {
+    s_rebuildScreenId = s_screen;   // the preempted static screen repaints
+  }
+  s_tickerDirty = true;
+}
+
+static void answerPrompt(bool yes) {
+  char buf[160];
+  snprintf(buf, sizeof(buf), "{\"type\":\"prompt.reply\",\"id\":\"%s\",\"answer\":\"%s\"}",
+           s_promptId, yes ? "yes" : "no");
+  sendText(String(buf));
+  Serial.printf("[hg] prompt.reply %s (%s)\n", yes ? "YES" : "NO", s_promptId);
+  promptTeardown(yes ? "answered:yes" : "answered:no");
+}
+
+static void deferPrompt() {   // "later": hide; re-raise on a timer
+  if (!s_promptOpen || !s_promptCardPainted) return;
+  s_promptCardPainted = false;
+  s_promptPending = true;
+  s_promptRaiseMs = millis() + 45000;
+  if (s_screen == SCR_EYES) {
+    M5.Display.fillCircle(kCircleC, kCircleC, kCircleR, TFT_BLACK);
+    avatar.invalidate();
+    s_ringState = kRingRedrawAll;
+  } else {
+    s_rebuildScreenId = s_screen;
+  }
+  drawStatusLineCol("QUESTION PENDING", 0x8A929Cu);
+  s_clearStatusAtMs = millis() + 4000;
+  s_tickerDirty = true;
+}
+
+static void drawPromptCard() {
+  auto &d = M5.Display;
+  d.fillCircle(kCircleC, kCircleC, 180, 0x0A0A12u);
+  d.drawCircle(kCircleC, kCircleC, 196, kPromptCol);
+  // v0.5.29 (F2): the card owns the WHOLE panel — clear the stale ring
+  // annulus (205..230) + the y=340 label band a pre-card state left behind;
+  // their painters are unreached while the card is up.
+  d.drawArc(kCircleC, kCircleC, 205, 230, 0, 360, TFT_BLACK);
+  d.fillRect(93, 339, 280, 17, TFT_BLACK);
+  eraseStatusLine();   // the card owns the panel: bands go idle-black
+  eraseTickerCell();
+  eraseDeltaStrip();
+  s_deltaLive = false; s_deltaDirty = false;
+  uiText("APPROVAL", 92, &fonts::FreeSansBold12pt7b, kPromptCol, 0x0A0A12u);
+  {  // title at 18pt; 27 caps ≈ 364 px ≤ chord@152 (~424)
+    char t18[28];
+    strlcpy(t18, s_promptTitle, sizeof(t18));
+    uiText(t18, 152, &fonts::FreeSans18pt7b, TFT_WHITE, 0x0A0A12u);
+  }
+  {  // body: up to 4 x 9pt rows, wrapped on spaces
+    char row[40];
+    int src = 0;
+    for (int r = 0; r < 4 && s_promptText[src]; ++r) {
+      const int16_t rowY = 196 + 18 * r;
+      int n = 0;
+      while (s_promptText[src + n] && n < 36) ++n;
+      if (s_promptText[src + n]) {
+        int b = n;
+        while (b > 12 && s_promptText[src + b] != ' ') --b;
+        if (b > 12) n = b;
+      }
+      memcpy(row, s_promptText + src, n); row[n] = 0;
+      src += s_promptText[src + n] ? n + 1 : n;
+      uiText(row, rowY, &fonts::FreeSans9pt7b, 0x9AA3ADu, 0x0A0A12u);
+    }
+  }
+  uiText("A YES", 320, &fonts::FreeSans18pt7b, TFT_WHITE, 0x0A0A12u,
+         lgfx::v1::textdatum_t::top_left, 90);
+  uiText("B NO", 320, &fonts::FreeSans18pt7b, 0xC9CFD6u, 0x0A0A12u,
+         lgfx::v1::textdatum_t::top_left, 250);
+  uiText("CLICK ANSWER - HOLD B LATER", 402, &fonts::FreeSans9pt7b,
+         0x5A6470u, TFT_BLACK);
+}
+
+// ---- v0.5.28: REPLY CARD — the readable answer. 9pt x 8 rows x 34 chars,
+// 272 chars/page + page tag. A=dismiss, B=page (last page falls to follow-up).
+static void drawReplyCard() {
+  auto &d = M5.Display;
+  const uint32_t accent = committedProfile().color;
+  d.fillCircle(kCircleC, kCircleC, 180, 0x0A0A12u);
+  d.drawCircle(kCircleC, kCircleC, 196, accent);
+  // v0.5.29 (F2): same panel ownership as the prompt card — a pre-card
+  // THINKING/SPEAKING ring arc + its y=340 label survived the card paint
+  // before (the 'overlay lines over the ring').
+  d.drawArc(kCircleC, kCircleC, 205, 230, 0, 360, TFT_BLACK);
+  d.fillRect(93, 339, 280, 17, TFT_BLACK);
+  eraseStatusLine();
+  eraseTickerCell();
+  eraseDeltaStrip();
+  s_deltaLive = false; s_deltaDirty = false;
+  constexpr size_t kPerPage = 272;   // 34 chars x 8 rows
+  const uint8_t pages = (uint8_t)((s_replyLen + kPerPage - 1) / kPerPage);
+  char tag[16];
+  snprintf(tag, sizeof(tag), "%u/%u", (unsigned)(s_replyPage + 1),
+           (unsigned)(pages ? pages : 1));
+  uiText("REPLY", 92, &fonts::FreeSansBold12pt7b, accent, 0x0A0A12u);
+  uiText(tag, 94, &fonts::FreeSans9pt7b, 0x5A6470u, 0x0A0A12u,
+         lgfx::v1::textdatum_t::top_left, 330);
+  size_t src = (size_t)s_replyPage * kPerPage;
+  for (int r = 0; r < 8; ++r) {
+    if (src >= s_replyLen) break;
+    const int16_t rowY = 140 + 19 * r;
+    size_t n = 0;
+    while (s_replyText[src + n] && n < 34) ++n;
+    if (s_replyText[src + n]) {
+      size_t b = n;
+      while (b > 10 && s_replyText[src + b] != ' ') --b;
+      if (b > 10) n = b;
+    }
+    char row[36];
+    memcpy(row, s_replyText + src, n); row[n] = 0;
+    const char *draw = row;
+    if (r > 0 && row[0] == ' ') draw = row + 1;
+    uiText(draw, rowY, &fonts::FreeSans9pt7b, TFT_WHITE, 0x0A0A12u);
+    src += n;
+  }
+  uiText(pages > (uint8_t)(s_replyPage + 1) ? "CLICK B NEXT PAGE"
+         : "A DISMISS - HOLD B TALK", 320, &fonts::FreeSans9pt7b,
+         0x5A6470u, 0x0A0A12u);
 }
 
 // ---- SCR_AGENTS: static screen (painted on entry / change only) ------------
@@ -839,59 +1151,109 @@ static void drawAgentsScreen() {
 }
 
 // ---- SCR_SETTINGS: static screen --------------------------------------------
+// ---- v0.5.20: battery ICON on SCR_SETTINGS (ollama-meter/HA-fridge style) ----
+// Shell rect + terminal nub + threshold fill; pct text beside the glyph.
+// Sampled at most every 30 s (I2C reads are slow); icon drawn in drawSettingsScreen.
+static int      s_battPct      = -1;    // -1 = unknown
+static bool     s_battCharging = false;
+static uint32_t s_battSampleMs = 0;
+
+static void batterySample() {
+  // UserDemo-style 3:1 smoothing (hal_pmic.cpp update_bat_level_from_mv): the ADC
+  // jitters on charge; the displayed % shouldn't wobble with every sample.
+  static uint32_t s_battFilteredMv = 0;
+  int32_t mv = M5.Power.getBatteryVoltage();
+  if (mv <= 0 || mv > 5000) { s_battPct = -1; return; }
+  if (s_battFilteredMv == 0) {
+    s_battFilteredMv = (uint32_t)mv;
+  } else {
+    // 3/4 old + 1/4 new, rounded (weight_sum = 4)
+    s_battFilteredMv = (s_battFilteredMv * 3u + (uint32_t)mv + 2u) / 4u;
+  }
+  int pct = (int)(((int32_t)s_battFilteredMv - 3300) * 100 / (4200 - 3300));
+  if (pct > 100) pct = 100;
+  if (pct < 0)   pct = 0;      // filtered real voltage below empty → 0%, not '??'
+  s_battPct = pct;             // '??' only for impossible sensor values (mv<=0/>5000)
+  s_battCharging = M5.Power.isCharging();
+}
+
 static void drawSettingsScreen() {
   auto &d = M5.Display;
   d.fillCircle(kCircleC, kCircleC, kCircleR, TFT_BLACK);
   const uint32_t accent = committedProfile().color;
 
-  // v0.5.1 title: FreeSansBold12pt7b scale 1 (was 9pt scale2).
+  // v0.5.1 title: FreeSansBold12pt7b scale 1.
   // 'SETTINGS' = 121px, ink rows 88..106, chord >= 209: fits 120px/side.
   uiText("SETTINGS", 88, &fonts::FreeSansBold12pt7b, TFT_WHITE, TFT_BLACK);
 
-  // volume: 230 px bar at y~230, filled in the committed agent's color
-  // (geometry UNCHANGED: bx=118..348, y=224..242 -- all inside the chord).
+  // v0.5.20 layout (user): whole text block UP; battery ICON sits below the
+  // volume bar like ollama-meter/HA-fridge (shell + nub + threshold fill), NOT a donut.
+  // Volume label/value smaller (12pt) to buy the space:
+  //   title 88 | VOLUME 118 | value 12pt 140 | bar 168..186 | HOST 216 |
+  //   FW/RSSI 244 | UP 272 | battery icon 300..322 | hint 396.
+  uiText("VOLUME", 118, &fonts::FreeSans9pt7b, 0x8A929Cu, TFT_BLACK);
+  char line[48];
+  snprintf(line, sizeof(line), "%.1f / 10", s_volumePct);
+  uiText(line, 138, &fonts::FreeSansBold12pt7b, TFT_WHITE, TFT_BLACK);
+
   constexpr int16_t kBarW = 230;
   constexpr int16_t kBarH = 18;
   const int16_t bx = kCircleC - kBarW / 2;
-  const int16_t y0 = kCircleC - kBarH / 2;
+  const int16_t y0 = 168;                       // was kCircleC-9 (=224)
   d.fillRoundRect(bx, y0, kBarW, kBarH, 6, 0x232B33u);
   const int16_t fillW = (int16_t)(kBarW * (s_volumePct / 10.0f) + 0.5f);
   if (fillW > 0) d.fillRoundRect(bx, y0, fillW, kBarH, 6, accent);
 
-  // v0.5.1 value row: display role, TRUE FreeSansBold24pt7b scale 1 (was 9pt
-  // scale4). '10.0 / 10' worst = 181px, ink rows 158..193, chord >= 221:
-  // fits 129px/side. Label above in dim meta; bar+value y untouched.
-  uiText("VOLUME", 130, &fonts::FreeSans9pt7b, 0x8A929Cu, TFT_BLACK);
-  char line[48];
-  snprintf(line, sizeof(line), "%.1f / 10", s_volumePct);
-  uiText(line, 156, &fonts::FreeSansBold24pt7b, TFT_WHITE, TFT_BLACK);
-
-  // v0.5.1 host row: meta 9pt scale 1 (was 9pt scale2 = 320px w/ 'host:' —
-  // M3 showed scale2's 19-char guard still allowed 498px). Worst legal
-  // 'HOST 192.168.100.100:8765' = 235px, ink rows 291..304, chord >= 219:
-  // fits 103px/side, no truncation needed at scale 1.
   if (strlen(s_wsHost)) {
     snprintf(line, sizeof(line), "HOST %s:%u", s_wsHost, s_wsPort);
   } else {
     snprintf(line, sizeof(line), "HOST unset");
   }
-  uiText(line, 290, &fonts::FreeSans9pt7b, 0x8A929Cu, TFT_BLACK);
+  uiText(line, 216, &fonts::FreeSans9pt7b, 0x8A929Cu, TFT_BLACK);
 
-  // v0.5.1 status rows: meta 9pt scale 1, single-line groups at 28px pitch.
-  // Widest measured 'FW v0.5.0  RSSI -99 dBm' = 207px @y318 (marg 106);
-  // 'UP 65535 min' = 114px @y346 (marg 137).
   char status[64];
   snprintf(status, sizeof(status), "FW v%s  RSSI %d dBm", HG_VER_TAG + 6, (int)WiFi.RSSI());
-  uiText(status, 318, &fonts::FreeSans9pt7b, 0x8A929Cu, TFT_BLACK);
+  uiText(status, 244, &fonts::FreeSans9pt7b, 0x8A929Cu, TFT_BLACK);
   snprintf(line, sizeof(line), "UP %lu min", (unsigned long)(millis() / 60000u));
-  uiText(line, 346, &fonts::FreeSans9pt7b, 0x8A929Cu, TFT_BLACK);
+  uiText(line, 272, &fonts::FreeSans9pt7b, 0x8A929Cu, TFT_BLACK);
 
-  // v0.5.1 hint: meta 9pt scale 1 @402 (ink 403..416, need 98/side vs 147).
-  uiText("CLICK +0.5 - HOLD -1.0", 402, &fonts::FreeSans9pt7b, 0x5A6470u, TFT_BLACK);
+  // v0.5.20 battery ICON (ollama-meter ui.cpp style): rect shell + terminal nub,
+  // threshold fill (red <20 / amber <50 / committed color >=50), pct beside.
+  if (millis() - s_battSampleMs > 30000 || (s_battPct < 0 && s_battSampleMs == 0)) {
+    batterySample();
+    s_battSampleMs = millis();
+  }
+  {
+    const int bp = s_battPct;
+    uint16_t bcol = bp < 0 ? 0x8A929Cu
+                  : (bp < 20 ? 0xE53935u : (bp < 50 ? 0xFFB300u : accent));
+    constexpr int gw = 52, gh = 22;
+    const int gx = kCircleC - gw / 2;           // centered
+    const int gy = 300;
+    d.fillRect(gx - 2, gy - 2, gw + 4, gh + 4, TFT_BLACK);  // erase cell once
+    d.drawRect(gx, gy, gw, gh, 0x8A929Cu);                  // shell
+    d.fillRect(gx + gw, gy + gh/2 - 4, 4, 8, 0x8A929Cu);    // terminal nub
+    int fw = bp > 0 ? (gw - 4) * bp / 100 : 0;
+    if (bp > 95) fw = gw - 4;                               // clamp the last %
+    if (fw > 0) d.fillRect(gx + 2, gy + 2, fw, gh - 4, bcol);
+    char bat[10];
+    if (bp < 0) snprintf(bat, sizeof(bat), "??");
+    else if (s_battCharging) snprintf(bat, sizeof(bat), "%d%%+", bp);
+    else snprintf(bat, sizeof(bat), "%d%%", bp);
+    // pct text: INSIDE the shell when unknown ("??"), right of the glyph otherwise
+    // (tx lands right of nub; Bold12 ink height ~17 fits the 22 px cell)
+    int tx = (bp < 0) ? gx + 10 : gx + gw + 10;
+    uiText(bat, bp < 0 ? gy + 4 : gy + 1, &fonts::FreeSansBold12pt7b, bcol, TFT_BLACK,
+           lgfx::v1::textdatum_t::top_left, tx);
+  }
+
+  // v0.5.1 hint: meta 9pt scale 1 (chord at 396..409: half ~146).
+  uiText("CLICK +0.5 - HOLD -1.0", 396, &fonts::FreeSans9pt7b, 0x5A6470u, TFT_BLACK);
 
 }
 
-// ---- SCR_CMDS: quick-action launcher (v0.5.9, James 2026-10-09 "4th screen" --
+
+// ---- SCR_CMDS: quick-action launcher (v0.5.9 user request, 2026-10-09 "4th screen" --
 // frequently used commands). BtnB click = next item, hold >=800 ms = send.
 // STATUS/RECAP ride the plain {"type":"text"} turn (hub '_h_text' -> agent
 // turn, works TODAY on both ends); STOP sends cancel; NEW SESSION opens a
@@ -918,7 +1280,8 @@ static void drawCommandsScreen() {
     uiText(row, y, &fonts::FreeSans18pt7b,
            sel ? accent : 0x9AA3ADu, TFT_BLACK);
   }
-  uiText("CLICK NEXT - HOLD SEND", 402, &fonts::FreeSans9pt7b, 0x5A6470u, TFT_BLACK);
+  uiText(s_cmdArmed ? "HOLD B CONFIRM - CLICK EXIT" : "CLICK NEXT - HOLD ARM",
+         402, &fonts::FreeSans9pt7b, s_cmdArmed ? 0xFFB300u : 0x5A6470u, TFT_BLACK);
 }
 
 // ---- screen switching -------------------------------------------------------
@@ -941,6 +1304,7 @@ static void gotoScreen(ScreenId scr) {
   agentHoldLatched = false;
   setHoldLatched = false;
   cmdHoldLatched = false;
+  s_cmdArmed = false;   // v0.5.28: leaving CMDS never fires the armed hold
   s_btnBSuppressMs = millis();
   s_screen = scr;
   if (s_screen == SCR_AGENTS) {
@@ -949,7 +1313,7 @@ static void gotoScreen(ScreenId scr) {
   } else if (s_screen == SCR_SETTINGS) {
     s_rebuildScreenId = SCR_SETTINGS;
   } else if (s_screen == SCR_CMDS) {
-    s_cmdSel = 0;
+    // v0.5.28: cursor PERSISTS across screen entries (used to snap to row 0)
     s_rebuildScreenId = SCR_CMDS;
   } else {  // SCR_EYES
     M5.Display.fillCircle(kCircleC, kCircleC, kCircleR, TFT_BLACK);
@@ -957,6 +1321,9 @@ static void gotoScreen(ScreenId scr) {
     s_toastUntilMs = 0;
     s_toastShown = false;
     s_ringState = kRingRedrawAll;
+    // v0.5.17 (F6): pixels wiped above — band state must match or a stale
+    // s_deltaLive leaves dead 'PAIRED'-era strip content
+    deltaClear(); s_deltaLive = false; s_deltaDirty = false;
   }
 }
 
@@ -972,6 +1339,53 @@ static void handleButtons(uint32_t nowMs) {
   if (M5.BtnB.wasPressed()) {
     btnBDownMs = nowMs;
     s_btnBPressScreen = s_screen;  // press origin tags the whole gesture (H2)
+  }
+  // v0.5.28: a card that owns the eyes screen hijacks BtnA/BtnB for its lifetime.
+  if (s_screen == SCR_EYES && s_promptCardPainted) {
+    if (M5.BtnA.wasClicked()) { answerPrompt(true); return; }
+    if (M5.BtnB.wasClicked() && !s_promptHoldLatched &&
+        nowMs - btnBHoldEndMs > 100) { answerPrompt(false); return; }
+    if (M5.BtnB.isPressed() && !s_promptHoldLatched && M5.BtnB.pressedFor(800)) {
+      s_promptHoldLatched = true;
+      deferPrompt();
+    }
+    if (!M5.BtnB.isPressed() && s_promptHoldLatched) {
+      s_promptHoldLatched = false; btnBHoldEndMs = nowMs;
+    }
+    return;
+  }
+  if (s_screen == SCR_EYES && s_replyCardShown) {
+    constexpr size_t kPerPage = 272;
+    const uint8_t pages = (uint8_t)((s_replyLen + kPerPage - 1) / kPerPage);
+    const bool lastPage = pages <= (uint8_t)(s_replyPage + 1);
+    if (M5.BtnB.wasClicked() && !s_replyHoldLatched &&
+        nowMs - btnBHoldEndMs > 100 && !lastPage) {
+      ++s_replyPage;
+      s_replyCardPainted = false;
+      s_replyRepaint = true;   // v0.5.29: page flip = one repaint
+      s_replyCardUntilMs = millis() + 12000;
+      return;
+    }
+    if (lastPage && M5.BtnB.isPressed() && !s_replyHoldLatched &&
+        M5.BtnB.pressedFor(800)) {
+      s_replyHoldLatched = true;
+      s_replyCardShown = false; s_replyCardPainted = false;
+      M5.Display.fillCircle(kCircleC, kCircleC, kCircleR, TFT_BLACK);
+      avatar.invalidate(); s_ringState = kRingRedrawAll;
+      s_btnBSuppressMs = millis();  // v0.5.29 (F3): H2 — swallow the hold's
+      voiceStartListening(true);    // release tail (phantom PTT guard)
+      return;
+    }
+    if (!M5.BtnB.isPressed() && s_replyHoldLatched) {
+      s_replyHoldLatched = false; btnBHoldEndMs = nowMs;
+    }
+    if (M5.BtnA.wasClicked()) {   // dismiss without talking
+      s_replyCardShown = false; s_replyCardPainted = false;
+      M5.Display.fillCircle(kCircleC, kCircleC, kCircleR, TFT_BLACK);
+      avatar.invalidate(); s_ringState = kRingRedrawAll;
+      return;
+    }
+    return;
   }
 
   // LEFT: global screen cycle
@@ -1035,19 +1449,32 @@ static void handleButtons(uint32_t nowMs) {
       drawCommandsScreen();
     }
     if (M5.BtnB.isPressed() && !cmdHoldLatched && M5.BtnB.pressedFor(800)) {
-      cmdHoldLatched = true;
-      Serial.printf("[ui] cmd send: %s\n", kQuickCmdLabel(s_cmdSel));
-      if (s_cmdSel == 2)       sendJson("cancel");       // STOP
-      else if (s_cmdSel == 3)  sendJson("session.new");  // fresh session
-      else {
-        char id[12];
-        snprintf(id, sizeof(id), "q%lu", (unsigned long)millis());
-        String payload = String("{\"type\":\"text\",\"id\":\"") + id +
-                         "\",\"text\":\"" + kQuickCmdText[s_cmdSel] +
-                         "\",\"agent\":\"" + committedAgentTag() + "\"}";
-        sendText(payload);
+      // v0.5.28: the first hold ARMS (status hint), the second hold CONFIRMS.
+      // STATUS/RECAP are billed agent turns — the arm step is a read-before-send.
+      if (!s_cmdArmed) {
+        cmdHoldLatched = true;
+        s_cmdArmed = true;
+        Serial.printf("[ui] cmd armed: %s\n", kQuickCmdLabel(s_cmdSel));
+        drawStatusLineCol("HOLD B TO CONFIRM", 0x8A929Cu);
+        s_clearStatusAtMs = 0;   // never auto-erase the armed hint
+      } else {
+        cmdHoldLatched = true;
+        s_cmdArmed = false;
+        Serial.printf("[ui] cmd send: %s\n", kQuickCmdLabel(s_cmdSel));
+        if (s_cmdSel == 2)       sendJson("cancel");       // STOP
+        else if (s_cmdSel == 3)  sendJson("session.new");  // fresh session
+        else {
+          char id[12];
+          snprintf(id, sizeof(id), "q%lu", (unsigned long)millis());
+          String payload = String("{\"type\":\"text\",\"id\":\"") + id +
+                           "\",\"text\":\"" + kQuickCmdText[s_cmdSel] +
+                           "\",\"agent\":\"" + committedAgentTag() + "\"}";
+          sendText(payload);
+        }
+        gotoScreen(SCR_EYES);
+        drawStatusLineCol("SENT", 0x8A929Cu);
+        s_clearStatusAtMs = millis() + 1200;
       }
-      gotoScreen(SCR_EYES);
     }
     if (!M5.BtnB.isPressed() && cmdHoldLatched) {
       cmdHoldLatched = false;
@@ -1088,9 +1515,13 @@ static void handleButtons(uint32_t nowMs) {
     if (s_diagMode) {
       // freeze the avatar for the full-screen diag view (rings/screens
       // resume on toggle-off); diag paints only on EYES-like idle screens
+      // v0.5.17 (F8): toast mid-toggle → defer the paint to expiry instead of
+      // silently dropping it (was: mode on, never painted, needed re-toggle)
       if (s_screen == SCR_EYES && !s_toastShown) {
         drawDiagnosticFrame();
         s_diagPainted = true;
+      } else {
+        s_diagPending = true;   // toast-expiry / eyes-paint path consumes this
       }
     } else {
       // restore the actual screen: EYES = engine full repaint; static
@@ -1118,17 +1549,22 @@ static void handleButtons(uint32_t nowMs) {
   }
   // v0.3: touch-hold = cancel (unchanged)
   const auto t = M5.Touch.getDetail(0);
-  if (t.wasHold()) {
-    sendJson("cancel");
-    Serial.println("[hg] cancel sent");
+  if (t.wasHold() && !s_promptCardPainted) {   // v0.5.28: the card owns DENY via
+    sendJson("cancel");                        // tap/B — never cancel the session
+    Serial.println("[hg] cancel sent");        // from under an open approval
   }
 }
 
 // ----------------------------------------------------- hg.v1 events ----
 
 void dispatchJson(const char *rx, size_t len) {
-  V.lastHubMs = millis();  // v0.5.12 hub-liveness stamp (turn-stall watchdog)
+  // v0.5.18: pings/pings-acks no longer refresh the turn-stall watchdog clock.
+  // The hub pings every 20 s (heartbeat_s=20) and the old stamp sat at dispatchJson's
+  // top — so `nowMs - lastHubMs` never exceeded the 20 s no-audio stall (nor the
+  // 3-min stall): v0.5.16's orphan watchdogs could never fire. The clock is stamped
+  // AFTER the ping handler below (every non-ping JSON is "real hub activity").
   // Text frames = JSON control surface. We parse with strstr (no dynamic alloc).
+  s_lastServerFrameMs = millis();  // v0.5.27: any frame proves the link is being served
   static char buf[1024];
   if (len >= sizeof(buf)) len = sizeof(buf) - 1;
   // python json.dumps sends '{"type": "challenge"}' WITH spaces after colons;
@@ -1226,12 +1662,110 @@ void dispatchJson(const char *rx, size_t len) {
     return;
   }
 
+  // v0.5.18: every NON-ping JSON stamps the turn-stall clock (ping-proof watchdog —
+  // the hub's 20 s heartbeat must not feed the "no hub activity" stall check).
+  V.lastHubMs = millis();
+  {  // v0.5.23 diag: log hub frame receipt (turn-critical types ALWAYS; others 1/s)
+    static bool s_crit = false;
+    s_crit = strstr(buf, "\"type\":\"turn.start\"") || strstr(buf, "\"type\":\"reply\"")
+          || strstr(buf, "\"type\":\"turn.end\"") || strstr(buf, "\"type\":\"audio.\"");
+    static uint32_t s_xlastMs = 0;
+    if (s_crit || millis() - s_xlastMs > 1000) {
+      if (s_crit) s_xlastMs = millis();
+      s_xlastMs = millis();
+      char dt[48];
+      const char *tp = strstr(buf, "\"type\":\"");
+      if (tp) {
+        tp += 8;
+        const char *e = strchr(tp, '"');
+        size_t n = e && (e - tp) < 36 ? (size_t)(e - tp) : 36;
+        memcpy(dt, tp, n); dt[n] = 0;
+      } else {
+        snprintf(dt, sizeof(dt), "<notype>");
+      }
+      char det[96];
+      snprintf(det, sizeof(det), "len=%u type=%s", (unsigned)strlen(buf), dt);
+      hubXlog("frame", det);
+    }
+  }
+
+  // v0.5.28: hub prompt = the approval/question the wrist must answer
+  // (hub ask() → slash-confirms, exec approvals, Hermes confirmations).
+  if (strstr(buf, "\"type\":\"prompt\"")) {
+    const char *idK = strstr(rx, "\"id\":\"");
+    if (idK) {
+      idK += 6;
+      const char *end = strchr(idK, '"');
+      if (end && (size_t)(end - idK) < sizeof(s_promptId)) {
+        memcpy(s_promptId, idK, (size_t)(end - idK));
+        s_promptId[end - idK] = 0;
+        jsonExtractString(rx, "\"title\":\"", s_promptTitle, sizeof(s_promptTitle));
+        jsonExtractString(rx, "\"text\":\"", s_promptText, sizeof(s_promptText));
+        const char *ttlK = strstr(buf, "\"ttl_s\"");
+        if (ttlK) {
+          const float ttl = (float)atof(ttlK + 8);
+          if (ttl > 1.0f) {
+            s_promptTtlMs = (uint32_t)(ttl * 1000.0f);
+            s_promptExpireMs = millis() + s_promptTtlMs;
+          }
+        }
+        s_promptOpen = true;
+        s_promptPending = false;
+        s_promptHoldLatched = false;
+        s_promptCardPainted = false;   // painted on the next loop pass
+  s_promptRepaint = true;        // v0.5.29: one full paint, then frozen
+        s_hubWaiting = true;           // watchdogs stand down while he decides
+        V.lastHubMs = millis();        // the prompt IS turn traffic
+        s_lastTurnFrameMs = millis();
+        hubXlog("prompt", "card armed");
+        Serial.printf("[hg] prompt: %.40s (ttl %s)\n", s_promptTitle,
+                      s_promptTtlMs ? "set" : "none");
+      }
+    }
+    return;
+  }
+  if (strstr(buf, "\"type\":\"prompt.close\"")) {
+    // withdrawal (hub re-shows with a new frame when it re-asks): clear ours.
+    promptTeardown("closed by hub");
+    return;
+  }
+
   // ---- turn lifecycle
-  if (strstr(buf, "\"type\":\"turn.start\"")) { s_turnActive = true; setStateFromServer("turn.start"); return; }
-  if (strstr(buf, "\"type\":\"status\""))      { setStateFromServer("status"); s_hasLiveStatus = true; return; }
+  s_lastTurnFrameMs = millis();  // v0.5.27: ping returns above — pings never count here
+  if (strstr(buf, "\"type\":\"turn.start\"")) {
+    // v0.5.25 multi-turn hygiene: a new turn re-arms the whole machine. If the
+    // previous turn's audio never got its audio.end (hub conn replaced mid-turn,
+    // pump death, lost frame), the orphaned stream was stranded until a watchdog
+    // fired 20-90 s later and every state check saw the stale stream. A fresh
+    // turn means the hub is talking about a new answer: drop any orphaned
+    // playback, clear counters, start the clock.
+    if (V.playStream) {
+      M5.Speaker.stop();
+      voicePlaybackReset();
+    }
+    s_turnActive = true;
+    s_turnStartMs = millis();
+    setStateFromServer("turn.start");
+    return;
+  }
+  if (strstr(buf, "\"type\":\"status\"")) {
+    jsonExtractString(rx, "\"text\":\"", s_statusText, sizeof(s_statusText));
+    s_hasLiveStatus = true;
+    s_tickerDirty = true;   // v0.5.28: the ticker paints at ≤1 Hz in loop()
+    const char *wk = strstr(buf, "\"waiting\":true");
+    const char *wf = strstr(buf, "\"waiting\":false");
+    if (wk) { s_hubWaiting = true; }
+    else if (wf) { s_hubWaiting = false; }
+    return;
+  }
   if (strstr(buf, "\"type\":\"transcript\"")) {
-    const char *t = strstr(rx, "\"text\":\"");
-    if (t) Serial.printf("[hg] transcript: %.80s\n", t + 8);
+    char you[40];
+    if (jsonExtractString(rx, "\"text\":\"", you, sizeof(you)) > 0) {
+      Serial.printf("[hg] transcript: %.80s\n", you);
+      char band[44];   // v0.5.28: a mis-hear is visible DURING thinking
+      snprintf(band, sizeof(band), "YOU: %.34s", you);
+      drawStatusLineCol(band, 0x9AA3ADu);
+    }
     return;
   }
   if (strstr(buf, "\"type\":\"reply.delta\"")) {
@@ -1262,35 +1796,45 @@ void dispatchJson(const char *rx, size_t len) {
         if (!c) break;
         deltaPushC((uint8_t)c);
       }
-      if (!s_toastShown) {                    // never collide with the toast
-        M5.Display.fillRect(100, 367, 266, 17, TFT_BLACK);  // y=368 strip, half-chord ~178, clear chord-safe box
+      if (s_screen == SCR_EYES && !s_toastShown) {   // v0.5.17 (F1): band belongs to the eyes screen
+        eraseDeltaStrip();
         deltaDraw();
         s_deltaLive = true;
+        s_deltaDirty = false;
+      } else {
+        s_deltaDirty = true;   // repaint the band when the eyes screen returns
       }
     }
     return;
   }
   if (strstr(buf, "\"type\":\"reply\"")) {
-    if (s_deltaLive) { M5.Display.fillRect(100, 367, 266, 17, TFT_BLACK); deltaClear(); s_deltaLive = false; }
-    const char *t = strstr(rx, "\"text\":\"");   // RAW rx: reply text keeps real spaces
-    if (t) {
-      t += 8;
-      const char *end = strchr(t, '"');   // stop at the JSON string terminator
-      const size_t n = end && (size_t)(end - t) < 120 ? (size_t)(end - t) : 120;
-      char msg[121]; memcpy(msg, t, n); msg[n] = 0;
-      Serial.printf("[hg] reply: %s\n", msg);
-    }
+    if (s_deltaLive && s_screen == SCR_EYES) { eraseDeltaStrip(); }
+    deltaClear(); s_deltaLive = false;
+    // v0.5.28: the hub delivers the FULL capped reply in one frame — store it
+    // for the reply card (raw rx keeps real spaces + JSON escapes to unescape).
+    const int rl = jsonExtractString(rx, "\"text\":\"", s_replyText, sizeof(s_replyText));
+    s_replyLen = rl > 0 ? (size_t)rl : 0;
+    s_replyPage = 0;
+    s_replyAutoPending = s_replyLen > 0;   // card shows once audio drains
+    char msg[121];
+    strlcpy(msg, s_replyText, sizeof(msg));
+    Serial.printf("[hg] reply: %s\n", msg);
     return;
   }
   if (strstr(buf, "\"type\":\"turn.end\"")) {
     s_turnActive = false;
+    s_turnStartMs = 0;
     s_hasLiveStatus = false;
-    if (s_deltaLive) { M5.Display.fillRect(100, 367, 266, 17, TFT_BLACK); deltaClear(); s_deltaLive = false; }
+    s_hubWaiting = false;   // v0.5.28: the turn resolved — waiting is over
+    // (the reply card shows after the audio drains via s_replyAutoPending)
+    if (s_deltaLive && s_screen == SCR_EYES) { eraseDeltaStrip(); }
+    deltaClear(); s_deltaLive = false; s_deltaDirty = false;
     // v0.5.16: a turn that NEVER had an audio phase (hub replaced the turn's
     // connection mid-turn — reply+turn.end landed on the new socket with no
     // audio.start/pcm/audio.end) wedges in THINKING/SPEAKING until the 3-min stall.
     // Snap straight back to idle when no audio ever existed in this turn.
     if (!V.micOpen && !V.playStream && !V.rUsed) {
+      hubXlog("snapback", "turn.end no-audio-phase");
       Serial.println("[voice] turn.end without audio phase — returning to idle");
       voiceReturnToIdle();
     }
@@ -1310,6 +1854,10 @@ void dispatchJson(const char *rx, size_t len) {
     V.playStream = stream;
     V.lastAudioInMs = millis();
     voiceAllocBuffers();
+    {  // v0.5.23 diag: audio.start handler ran
+      char det[80]; snprintf(det, sizeof(det), "stream=%u rate=%lu", (unsigned)stream, (unsigned long)rate);
+      hubXlog("audio.start", det);
+    }
     Serial.printf("[voice] tts stream %u @%lu Hz\n", (unsigned)stream, (unsigned long)rate);
     avatar.show(ExpressionId::Happy, millis(), false);
     return;
@@ -1331,6 +1879,7 @@ void dispatchJson(const char *rx, size_t len) {
     const char *st = strstr(buf, "\"stream\":");
     const uint16_t stream = st ? (uint16_t)atoi(st + 9) : V.playStream;
     if (stream == V.playStream && V.playStream) {
+      { char det[48]; snprintf(det, sizeof(det), "abort stream=%u", (unsigned)stream); hubXlog("audio-abort", det); }
       Serial.println("[voice] tts aborted");
       voicePlaybackReset();
       M5.Speaker.stop();
@@ -1365,12 +1914,17 @@ bool hgConnect() {
 // on socket death (send failure / server close / poll close frame)
 void hgSocketDead() {
   if (!s_connected) return;
+  hubXlog("socket-dead", "hgSocketDead entered");
   s_connected = false;
   s_paired = false;
   // v0.5.12: a dead socket can never deliver turn.end — clear the orphaned turn
   // state or VH.ready() stays false and every later PTT reports "resource busy"
   // (the 2026-10-09 hang: gateway restart mid-turn wedged the watch until reboot).
-  if (s_turnActive) { s_turnActive = false; s_hasLiveStatus = false; deltaClear(); s_deltaLive = false; }
+  if (s_turnActive) {
+    s_turnActive = false; s_hasLiveStatus = false;
+    if (s_deltaLive && s_screen == SCR_EYES) { eraseDeltaStrip(); }  // v0.5.17 (F3)
+    deltaClear(); s_deltaLive = false; s_deltaDirty = false;
+  }
   if (V.micOpen) { V.micOpen = false; M5.Mic.end(); Serial.println("[voice] mic closed (socket down)"); }
   voicePlaybackReset();
   M5.Speaker.stop();
@@ -1437,6 +1991,14 @@ void setup() {
   M5.begin(config);
   Serial.begin(115200);
 
+  // v0.5.21: enable battery charging on the M5PM1 PMIC. The official StopWatch
+  // UserDemo (hal_pmic.cpp) calls setChargeEnable(true) at boot; M5Unified's
+  // Power.begin never does for board_M5StopWatch, and a PMIC that cold-reset
+  // (battery fully drained, as on 2026-10-09) comes back with charge DISABLED —
+  // the watch then sits on the charger for hours showing 0%. Enable it once at
+  // boot; the PMIC holds the setting through soft reboots afterwards.
+  M5.Power.setBatteryCharge(true);
+
   M5.Display.setRotation(0);
   M5.Display.setBrightness(150);
   M5.Display.fillScreen(TFT_BLACK);
@@ -1454,6 +2016,7 @@ void setup() {
   // Voice hook wiring (anonymous namespace → VH fn pointers)
   VH.ready   = [] { return s_connected && s_paired && WiFi.status() == WL_CONNECTED && !s_turnActive; };
   VH.playbackIdle = [] { voiceReturnToIdle(); };
+  VH.xlog = [](const char *n, const char *d) { hubXlog(n, d); };   // v0.5.23 diag
   VH.noRam   = [] { Serial.println("[voice] PSRAM alloc failed — voice disabled");
                     avatar.show(ExpressionId::Confused, millis(), false, 400); };
   VH.cancel  = [] { sendJson("cancel"); Serial.println("[hg] cancel sent (barge-in)"); };
@@ -1568,15 +2131,54 @@ void loop() {
   //   (b) a 'reply'/'turn.end' landing mid-turn with ZERO audio phase — snap back to
   //       idle immediately (handled inline in dispatchJson where reply/turn.end arrive).
   if (s_turnActive && !V.micOpen) {
+  {  // v0.5.22 diag: 5 s turn-stall state heartbeat (hub-side INFO log)
+    static uint32_t s_xtick = 0;
+    if (s_turnActive && nowMs - s_xtick > 5000) {
+      s_xtick = nowMs;
+      char det[128];
+      snprintf(det, sizeof(det),
+               "turnActive=1 micOpen=%d playStream=%u rUsed=%u lastHubAgo=%lims turnAge=%lims",
+               (int)V.micOpen, (unsigned)V.playStream, (unsigned)V.rUsed,
+               (long)(nowMs - V.lastHubMs), (long)(s_turnStartMs ? nowMs - s_turnStartMs : -1));
+      hubXlog("turnstate", det);
+    }
+  }
+
     const bool noAudioYet = !V.playStream && !V.rUsed;
     const uint32_t stall = noAudioYet ? kTurnStallNoAudioMs : kTurnStallMs;
-    if ((int32_t)(nowMs - V.lastHubMs) > stall) {
+    // v0.5.19: WALL-CLOCK floor — whatever liveness evidence exists (pings, half-open
+    // sockets, a hub that answers but never advances the turn), a turn that has
+    // produced NO audio phase may not outlive 90 s from its start. THINKING is a
+    // transient state, not a residence.
+    const bool turnTooOld = (noAudioYet && s_turnStartMs &&
+                             (int32_t)(nowMs - s_turnStartMs) > 90000);
+    // v0.5.28: a parked prompt is a RESIDENCE, not a stall — the hub is waiting
+    // for the user; watchdogs stand down (same rule read-idle uses below).
+    const bool promptParked = s_hubWaiting || s_promptOpen;
+    if (!promptParked && (turnTooOld || (int32_t)(nowMs - V.lastHubMs) > stall)) {
+      hubXlog("turn-wd", "watchdog fired");
       Serial.println("[hg] turn stall watchdog: no hub activity — clearing turn state");
+      hubXlog("watchdog fired", "clearing turn state");
       s_turnActive = false;
+      s_turnStartMs = 0;
       s_hasLiveStatus = false;
-      deltaClear(); s_deltaLive = false;
+      if (s_deltaLive && s_screen == SCR_EYES) { eraseDeltaStrip(); }  // v0.5.17 (F3)
+      deltaClear(); s_deltaLive = false; s_deltaDirty = false;
       voiceReturnToIdle();
       setStateFromServer("turn.stall-clear");
+    }
+  }
+
+  {  // v0.5.22 diag: 10 s global device-state tick (idle too — hub-side INFO)
+    static uint32_t s_xg = 0;
+    if (nowMs - s_xg > 10000) {
+      s_xg = nowMs;
+      char det[160];
+      snprintf(det, sizeof(det),
+               "turnActive=%d micOpen=%d playStream=%u rUsed=%u connected=%d wifi=%d freeHeap=%u",
+               (int)s_turnActive, (int)V.micOpen, (unsigned)V.playStream, (unsigned)V.rUsed,
+               (int)s_connected, (int)(WiFi.status() == WL_CONNECTED), (unsigned)ESP.getFreeHeap());
+      hubXlog("devstate", det);
     }
   }
 
@@ -1636,30 +2238,77 @@ void loop() {
   static uint32_t playWatchMs = 0;   // run-on cap (90 s overall), unchanged
   static uint32_t playLastFrame = 0; // v0.5.9 stall: last inbound audio frame
   if (V.playStream) {
-    if (playWatchMs == 0) { playWatchMs = nowMs; playLastFrame = V.lastAudioInMs; }
-    else if (V.lastAudioInMs != playLastFrame) {
+    // v0.5.25 THE 0.5.9-STALL BUG: playLastFrame was seeded from V.lastAudioInMs
+    // (stamped during THIS pass's ws.poll — AFTER loop-top nowMs was captured), so
+    // on the stream's first pass `nowMs - playLastFrame` went NEGATIVE and, as an
+    // unsigned diff, wrapped to ~4.29e9 > 5000 → the "5 s no-frames" watchdog
+    // fired ~90 ms into EVERY healthy stream and reset the playback the moment
+    // the first PCM frame landed (the multi-hour black-hole + REFUSE trace).
+    // Fix: clock the watchdog with a FRESH millis() (post-poll), make the stall
+    // test signed, and re-seed if the seed was unsane.
+    const uint32_t wNowMs = millis();
+    if (playWatchMs == 0) { playWatchMs = wNowMs; playLastFrame = V.lastAudioInMs; }
+    if (V.lastAudioInMs != playLastFrame) {
       playLastFrame = V.lastAudioInMs;              // frames still flowing
-    } else if (!V.playEnded && nowMs - playLastFrame > 5000) {
-      // v0.5.9: a hub pump that dies
-      // mid-stream used to strand the device in SPEAKING forever — no
-      // audio.end ever arrived. 5 s of zero frames while playing = dead
-      // stream: un-stick locally. (Hub-side abort-on-pump-death is queued.)
-      Serial.println("[voice] audio stall watchdog: 5 s with no frames — reset");
-      playWatchMs = 0;
-      M5.Speaker.stop();
-      voicePlaybackReset();  // clears V.playStream → ring/idle, mic usable
-      drawStatusLine("AUDIO STALLED");
-      avatar.show(ExpressionId::Confused, millis(), false, 400);
-    } else if (nowMs - playWatchMs > 90000) {
+    }
+    // v0.5.18: the 90 s cap is NOT an else-if of the frames-flowing check — a
+    // stream that keeps receiving frames the speaker can't keep up with never
+    // reached the cap (chain starvation). Hard deadline wins over busy streams.
+    if ((int32_t)(wNowMs - playWatchMs) > 90000) {
+      hubXlog("play-wd90", "90s cap fired");
       Serial.println("[voice] playback watchdog: stream exceeded 90 s — stopped");
       playWatchMs = 0;
       M5.Speaker.stop();
       voicePlaybackReset();   // clears V.playStream → ring falls back to IDLE
       drawStatusLine("PLAYBACK STOPPED");
       avatar.show(ExpressionId::Confused, millis(), false, 400);
+    } else if (!V.playEnded && (int32_t)(wNowMs - playLastFrame) > 5000) {
+      // v0.5.9: a hub pump that dies
+      // mid-stream used to strand the device in SPEAKING forever — no
+      // audio.end ever arrived. 5 s of zero frames while playing = dead
+      // stream: un-stick locally. (Hub-side abort-on-pump-death is queued.)
+      hubXlog("audio-stall5", "5s no frames fired");
+      Serial.println("[voice] audio stall watchdog: 5 s with no frames — reset");
+      playWatchMs = 0;
+      M5.Speaker.stop();
+      voicePlaybackReset();  // clears V.playStream → ring/idle, mic usable
+      drawStatusLine("AUDIO STALLED");
+      avatar.show(ExpressionId::Confused, millis(), false, 400);
     }
   } else {
     playWatchMs = 0;          // stream ended/aborted → rearm the watchdog
+  }
+  // v0.5.27: watchdogs for the two stuck classes the audio watchdog cannot see.
+  // Both use int32_t signed diffs (the 0.5.25 lesson: unsigned subtraction of a
+  // stamp captured after the clock read wraps to ~4.29e9 and false-fires).
+  {  // (1) orphaned socket: hub replaced us — zero frames, not even pings.
+    static uint32_t s_lastIdleLog = 0;
+    if (s_connected && s_lastServerFrameMs &&
+        (int32_t)(nowMs - s_lastServerFrameMs) > 60000) {
+      if (nowMs - s_lastIdleLog > 5000) {  // log once, not every loop pass
+        s_lastIdleLog = nowMs;
+        hubXlog("read-idle", "60s no hub frames — reconnecting");
+        Serial.println("[hg] read idle: no hub frames in 60 s — reconnect");
+        hgSocketDead();
+      }
+    } else {
+      s_lastIdleLog = 0;
+    }
+  }
+  {  // (2) lost turn end: frames keep flowing (pings) but the turn never closed.
+    // v0.5.28: same waiting exemption (a prompt parks the turn for minutes)
+    if (s_turnActive && s_lastTurnFrameMs && !(s_hubWaiting || s_promptOpen) &&
+        (int32_t)(nowMs - s_lastTurnFrameMs) > 90000) {
+      hubXlog("turn-stuck", "90s no turn traffic — clearing");
+      Serial.println("[hg] turn watchdog: no turn traffic in 90 s — clearing stuck turn");
+      s_turnActive = false;
+      s_turnStartMs = 0;
+      s_hasLiveStatus = false;
+      if (s_deltaLive && s_screen == SCR_EYES) { eraseDeltaStrip(); }
+      deltaClear(); s_deltaLive = false; s_deltaDirty = false;
+      voiceReturnToIdle();
+      s_lastTurnFrameMs = 0;
+    }
   }
   // v0.5.14: erase the status band once "idle for real" so the screen is fully
   // black between turns (no lingering PLAYBACK STOPPED / face label).
@@ -1668,6 +2317,19 @@ void loop() {
       eraseStatusLine();
     }
     s_clearStatusAtMs = 0;
+  }
+  // v0.5.29 (F8): a deferred ("later") prompt re-raises itself — 0.5.28 set
+  // s_promptRaiseMs but nothing consumed it (defer = card lost until next one).
+  if (s_promptPending && s_promptRaiseMs &&
+      (int32_t)(nowMs - s_promptRaiseMs) >= 0) {
+    s_promptRaiseMs = 0;
+    s_promptPending = false;
+    s_promptOpen = true;
+    s_promptCardPainted = false;
+    s_promptRepaint = true;
+    if (s_screen != SCR_EYES) gotoScreen(SCR_EYES);  // card preempts any screen
+    s_ringState = kRingRedrawAll;
+    hubXlog("prompt", "re-raised");
   }
   Ota::tick();
   handleProductTouch(nowMs);
@@ -1685,6 +2347,7 @@ void loop() {
     } else if (s_rebuildScreenId == SCR_CMDS) {
       drawCommandsScreen();
     } else {  // SCR_SETTINGS
+      s_battSampleMs = 0;   // v0.5.20: fresh battery sample on every entry
       drawSettingsScreen();
     }
     s_rebuildScreenId = SCR_EYES;
@@ -1693,6 +2356,29 @@ void loop() {
       // H3: diagnostics view owns the panel while active — engine frozen.
       if (s_diagMode && s_diagPainted) {
         // nothing per frame; 1 Hz refresh happens in handleButtons
+      } else if (s_promptCardPainted && s_promptExpireMs &&
+                 (int32_t)(nowMs - s_promptExpireMs) >= 0) {
+        // v0.5.28: ttl expired unanswered — say so, then park for the hub flow.
+        eraseStatusLine();
+        drawStatusLineCol("QUESTION EXPIRED", 0xE53935u);
+        s_clearStatusAtMs = millis() + 2500;
+        promptTeardown("expired");
+      } else if (s_promptCardPainted) {
+        // v0.5.29 (F1): static card — paint ONCE, then park the pass. Full
+        // redraws every pass starved the ring to <24fps (SPI saturation).
+        if (s_promptRepaint) {
+          s_promptRepaint = false;
+          drawPromptCard();
+        }
+      } else if (s_replyCardPainted) {
+        if ((int32_t)(nowMs - s_replyCardUntilMs) >= 0) {
+          s_replyCardShown = false; s_replyCardPainted = false;
+          M5.Display.fillCircle(kCircleC, kCircleC, kCircleR, TFT_BLACK);
+          avatar.invalidate(); s_ringState = kRingRedrawAll;
+        } else if (s_replyRepaint) {
+          s_replyRepaint = false;
+          drawReplyCard();
+        }
       } else if (nowMs < s_toastUntilMs) {
         // H1: toast window — the engine is FROZEN here. avatar.update()
         // renders its queued full-clear (fillScreen) on the same pass the
@@ -1711,12 +2397,53 @@ void loop() {
         M5.Display.fillCircle(kCircleC, kCircleC, kCircleR, TFT_BLACK);
         avatar.invalidate();
         s_ringState = kRingRedrawAll;
+        // v0.5.17 (F6): the disc wipe erased the band pixels; restore the live strip
+        if (s_deltaLen) { deltaDraw(); s_deltaLive = true; }
+        else { s_deltaLive = false; s_deltaDirty = false; }
+        // v0.5.17 (F8): diag toggled ON while the toast covered the screen
+        if (s_diagMode && s_diagPending) { drawDiagnosticFrame(); s_diagPainted = true; }
+        s_diagPending = false;
+      } else if (s_promptOpen && !s_promptCardPainted) {
+        // v0.5.28: a prompt (fresh or de-"later"-ed) preempts the avatar —
+        // frozen render, card painted over the full disc, ring keeps cycling
+        // outside r196 like the commit toast.
+        s_promptCardPainted = true;
+        M5.Display.fillCircle(kCircleC, kCircleC, kCircleR, TFT_BLACK);
+        avatar.invalidate();
+        s_promptRepaint = true;   // v0.5.29: paint once in the slot below
+        s_ringState = kRingRedrawAll;
+      } else if (s_replyCardShown && !s_replyCardPainted) {
+        // v0.5.28: the readable reply card — same preempt pattern.
+        s_replyCardPainted = true;
+        M5.Display.fillCircle(kCircleC, kCircleC, kCircleR, TFT_BLACK);
+        avatar.invalidate();
+        drawReplyCard();
+        s_ringState = kRingRedrawAll;
       } else {
         avatar.update(nowMs);
         drawRingFor(turnStateName(), nowMs);
+        // v0.5.17 (F1): a live turn's strip was suppressed while another screen
+        // showed — repaint it now that the eyes screen owns the panel again
+        if (s_deltaDirty && s_deltaLen) { eraseDeltaStrip(); deltaDraw(); s_deltaLive = true; }
+        s_deltaDirty = false;
+        // v0.5.28 ticker: v0.5.29 (F4) — age text changes once per SECOND; a
+        // (nowMs >= s_lastRingMs) gate is always-true and repainted the strip
+        // every pass (fps thief + flicker). Redraw on flag or second-tick.
+        if (s_tickerDirty || (s_statusText[0] && (s_lastTickerSec !=
+                              (uint32_t)(nowMs / 1000u)))) {
+          s_lastTickerSec = (uint32_t)(nowMs / 1000u);
+          drawTicker(nowMs);
+        }
       }
     }
-    // SCR_AGENTS / SCR_SETTINGS / SCR_CMDS: fully static — nothing per frame.
+    // SCR_AGENTS / SCR_SETTINGS / SCR_CMDS: fully static — nothing per frame,
+    // except the v0.5.20 battery tick (30 s refresh on SETTINGS: re-samples and
+    // repaints the whole settings screen so the icon stays live).
+    else if (s_screen == SCR_SETTINGS) {
+      if (nowMs - s_battSampleMs >= 30000) {
+        drawSettingsScreen();
+      }
+    }
   }
 
   delay(1);

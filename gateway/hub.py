@@ -14,6 +14,8 @@ import base64
 import contextlib
 import json
 import logging
+import os
+import pathlib
 import secrets
 import time
 import uuid
@@ -33,6 +35,43 @@ MIN_UTTERANCE_S = 0.25
 MAX_FRAME_BYTES = 1 << 20
 MAX_PENDING_DEVICES = 16     # unapproved devices the store keeps, in total...
 MAX_PENDING_PER_ADDRESS = 4  # ...and from one network address
+
+# Google Home helper used by the device channel prompt (speaker-capped devices):
+# env-overridable so an install never ships a machine-specific absolute path.
+# Default resolves the vendored skill script RELATIVE to the Hermes home — no
+# hardcoded username in the path; set GOOGLE_HOME_CMD in .env to override.
+def _default_google_home_cmd() -> str:
+    """Resolve the Google Home helper without hardcoding a user dir.
+
+    Order: $GOOGLE_HOME_CMD (set in .env) > $HERMES_HOME skills > any profile's
+    skills dir. The python venv is expected in $HERMES_HOME/tools/google-home-venv.
+    """
+    if os.environ.get("GOOGLE_HOME_CMD"):
+        return os.environ["GOOGLE_HOME_CMD"]
+    home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
+    home_p = pathlib.Path(home)
+    root = home_p
+    if home_p.name == "profiles" or (home_p.parent.name == "profiles"):
+        root = home_p.parent.parent if home_p.name == "profiles" else home_p.parent.parent
+    venvs = [home_p / "tools/google-home-venv/bin/python",   # profile-local tools
+             pathlib.Path.home() / ".hermes/tools/google-home-venv/bin/python"]
+    venv = next((v for v in venvs if v.exists()), None)
+    if venv is None:
+        return "echo 'GOOGLE_HOME_CMD set a $GOOGLE_HOME_CMD — google-home-venv not found'"
+    # skill probe order: this home's skills, then every profile's skills
+    homes = [home_p / "skills"]
+    profiles_root = home_p / "profiles"
+    if profiles_root.is_dir():
+        for prof in sorted(profiles_root.iterdir()):
+            if prof.is_dir():
+                homes.append(prof / "skills")
+    for base in homes:
+        cand = base / "smarthome/google-home-control/scripts/assist.py"
+        if cand.exists():
+            return f"{venv} {cand}"
+    return "echo 'GOOGLE_HOME_CMD not set and google-home-control skill not found'"
+
+GOOGLE_HOME_CMD = os.environ.get("GOOGLE_HOME_CMD") or _default_google_home_cmd()
 
 
 class HubDelegate:
@@ -143,6 +182,8 @@ class AudioOut:
         self.closed = self.aborted = True
         if self._task:
             self._task.cancel()
+            with contextlib.suppress(Exception):
+                await self._task
         try:
             await self._session.send_json(protocol.message("audio.abort", stream=self.stream))
         except Exception:
@@ -176,7 +217,7 @@ class AudioOut:
             log.warning("[audio pump] stopped stream=%s after %.1fs: %s", self.stream, self.sent_seconds, exc)
             # The device keeps a 'speaking' state until audio.end/abort for this stream —
             # a swallowed pump error left it stuck on the SPEAKING ring forever (blue,
-            # device must never stay stuck in 'speaking' when the pump dies.
+            # user report 2026-10-09). Always un-block the device when the pump dies.
             with contextlib.suppress(Exception):
                 await self._session.send_json(protocol.message("audio.abort", stream=self.stream))
         finally:
@@ -212,6 +253,9 @@ class DeviceSession:
         self.closed = False
         self._send_lock = asyncio.Lock()
         self._upload: _Upload | None = None
+        self.turn_agent: str | None = None  # v0.5.10: committed agent for the turn in flight
+        self.waiting: bool = False  # v0.5.28: a prompt is parked -> device pauses stall watchdogs
+        self.turn_open: str | None = None  # HUB-1: turn id currently in flight
         self._audio_out: AudioOut | None = None
         self._stream_counter = 0
         self._pending: dict[str, asyncio.Future] = {}
@@ -276,11 +320,15 @@ class DeviceSession:
     async def send_transcript(self, text: str) -> None:
         await self.send_json(protocol.message("transcript", text=text))
 
-    async def send_status(self, text: str) -> None:
-        await self.send_json(protocol.message("status", text=text))
+    async def send_status(self, text: str, *, waiting: bool | None = None) -> None:
+        if waiting is None:
+            await self.send_json(protocol.message("status", text=text))
+        else:
+            self.waiting = bool(waiting)
+            await self.send_json(protocol.message("status", text=text, waiting=bool(waiting)))
 
-    async def send_notice(self, text: str, ttl_s: float = 8) -> None:
-        await self.send_json(protocol.message("notice", text=text, ttl_s=ttl_s))
+    async def send_notice(self, text: str, ttl_s: float = 8, level: str = "info") -> None:
+        await self.send_json(protocol.message("notice", text=text, ttl_s=ttl_s, level=level))
 
     async def turn_start(self, turn: str) -> None:
         await self.send_json(protocol.message("turn.start", turn=turn))
@@ -437,12 +485,24 @@ class DeviceSession:
             # screen. GLM's scratchpad (2389-char reply, 2026-10-08) leaked verbatim
             # into speech. State the mode imperatively — adapter-side stripping is
             # best-effort backup, not the primary control.
+            # v0.5.15: hardened after the 2026-10-09 field tests — the routed brain
+            # (a chatty strategist persona) still produced 2-13k-char essays whose
+            # head got spoken, echoed its own debugging vocabulary ("I've staged a
+            # fix"), and never called the home-control tool. Tightened: word cap,
+            # act-don't-discuss, no internals vocabulary, use the tool immediately.
             parts.append(
                 "This reply is SPOKEN aloud through the device speaker and shown on a tiny "
-                "screen. Output ONLY the final user-facing answer: 1-3 short plain-text "
-                "sentences. NEVER include planning, reasoning, self-notes, alternatives, or "
-                "draft replies — anything you write is read aloud verbatim. No markdown, no "
-                "lists, no emoji.")
+                "screen. Output ONLY the final user-facing answer: at most TWO short "
+                "plain-text sentences, 30 words maximum. NEVER include planning, reasoning, "
+                "self-notes, alternatives, status reports about 'fixes'/'staging'/"
+                "'backends', or anything about restarts, firmware, configs, or debugging — "
+                "anything you write is read aloud verbatim. No markdown, no lists, no emoji. "
+                "If the user asks for an ACTION on a home device, immediately run the "
+                "Google Home command script instead of describing it, then answer briefly. "
+                f"The exact command: run via terminal — \"{GOOGLE_HOME_CMD} "
+                "'<the user's command>'\" (full path, no cd, no shell expansion). Report Google's "
+                "spoken confirmation in one short sentence. If it fails twice, say "
+                "so in one sentence — never essay about alternate integrations.")
         else:
             parts.append("It has no speaker; replies are only shown on screen.")
         if self.actions:
@@ -620,6 +680,14 @@ class DeviceHub:
             previous = self.sessions.get(session.device_id)
             self.sessions[session.device_id] = session
             if previous is not None:
+                if previous.turn_open:
+                    session.turn_open = previous.turn_open
+                    with contextlib.suppress(Exception):
+                        await session.send_json(protocol.message("turn.start", turn=previous.turn_open))
+                if previous._upload is not None:
+                    up = previous._upload
+                    with contextlib.suppress(Exception):
+                        await session.send_json(protocol.message("audio.abort", stream=up.stream))
                 await previous.close("replaced by a newer connection")
             session.paired = bool(await self.delegate.is_paired(session))
             if session.paired:
@@ -684,11 +752,22 @@ class DeviceHub:
         await handler(self, session, msg)
 
     async def _h_text(self, session: DeviceSession, msg: dict) -> None:
+        if not session.paired:
+            # v0.5.13 fix: only operator-paired devices may open turns. (Auth happens at
+            # the WS layer; pairing is the separate operator approval.)
+            await session.send_notice("Device not approved yet — waiting for pairing")
+            return
         text = str(msg.get("text") or "").strip()
+        # v0.5.10: the device's committed agent rides text turns; the adapter routes via
+        # agent_profiles. Stored raw; only values present in the configured map are honored.
+        session.turn_agent = str(msg.get("agent") or "").strip().lower() or None
         if text:
             session.spawn(self.delegate.on_text(session, str(msg.get("id") or ""), text[:4000]))
 
     async def _h_audio_start(self, session: DeviceSession, msg: dict) -> None:
+        if not session.paired:
+            await session.send_notice("Device not approved yet — waiting for pairing")
+            return
         fmt = msg.get("format", "pcm16")
         if fmt != "pcm16":
             await session.send_notice(f"Unsupported audio format {fmt!r}")
@@ -699,6 +778,9 @@ class DeviceHub:
             return
         session._upload = _Upload(
             id=str(msg.get("id") or ""), stream=int(msg.get("stream") or 0), rate=rate, started=time.monotonic())
+        # v0.5.10: voice turns carry the committed agent on audio.start
+        a = str(msg.get("agent") or "").strip().lower()
+        session.turn_agent = a or None
 
     def _on_binary(self, session: DeviceSession, data: bytes) -> None:
         frame = protocol.parse_binary(data)
