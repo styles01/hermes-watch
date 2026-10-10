@@ -17,6 +17,17 @@
 | Identity / authz / session-key derivation | core import-time binding | **NO** | gateway restart (correctness-first; do not monkey-patch live) |
 | OTA staging | `plugin-data/gadget/updates/` | hot always | file-based queue |
 
+## THE binding (verify before anything else)
+**Gadget turns resolve their toolset from `platform_toolsets.gadget` in the ROUTED
+profile's config. The default composite `hermes-gadget` does NOT exist in the toolsets
+registry → `resolve_toolset('hermes-gadget')` = [] → the brain gets ZERO tools and can
+only write prose (tool_turns=0, essays, "I can't do that").** Telegram works because
+`hermes-telegram` is a registered builtin composite (60 tools). Fix (2026-10-09): an
+explicit `platform_toolsets.gadget:` list in the venus profile config → 23 tools resolve.
+Config reads are per-turn (signature-cached) so this edit is HOT. Probe proof: session
+20261009_202356_f66d5304 went from tool_turns=0 (first turn) to 5 terminal tool-turns
+(after the config edit) on the SAME session.
+
 ## Rules (each one paid for in outages)
 
 1. **Before touching core config for a device problem, STOP.** Ask: "is this a plugin
