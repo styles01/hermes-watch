@@ -89,6 +89,7 @@ OTA queue the device's bootloader trusts. Install as a Hermes plugin —
 [docs/GATEWAY.md](docs/GATEWAY.md) covers pairing, config and the CLI.
 
 Protocol reference: [docs/PROTOCOL.md](docs/PROTOCOL.md) (frames, channels, auth).
+Gateway-side integration lessons (TTS/STT/auth/watchdogs): [docs/GATEWAY-LEARNINGS.md](docs/GATEWAY-LEARNINGS.md).
 
 ## Over-the-air updates
 
