@@ -14,6 +14,31 @@
 
 # Changelog
 
+## v1.1.1 — device firmware v0.5.30 (2026-10-10)
+
+### Added
+- **Loader image**: `hermes-watch-v<fw>-m5stack-loader.bin` on Releases — a
+  full-flash (16 MB) merged image (bootloader + partition table + app at
+  0x10000) for M5Burner-style one-shot flashing. The embedded table carries
+  `ota_1` at 0x400000 (3 MB), so a loader flash still has OTA-capable slots.
+- Card audit write-up: docs/CARDS-AUDIT-0.5.30.md (17 defects, ranked, with
+  line-precise rationale).
+
+### Fixed
+- Defer ("HOLD B LATER") now actually hides the card (no blink, no double flash).
+- `prompt.close` reachable (withdrawn approvals clear from the watch).
+- Prompt teardown no longer black-holes a concurrent reply card.
+- Band wipes moved out of per-pass repaints (flicker halo gone).
+- Reply pagination derived from the real text wrap — no silently dropped tail.
+- Reply card: 3 headline rows at 24pt bold + 4 continuation rows at 9pt; page
+  tag right-pinned; hints split per page; 12 pt A/B answer labels (chord-safe).
+- Reply card tracks the live delta (re-extracts + repaints; fresh 12 s timer).
+- Fresh replies never nuke a card you're mid-read on.
+- Haptic ticks on prompt arrival / re-raise (first vibration support).
+- Prompt titles wrap at 9pt instead of hard-clip; body rows buffer-bounded.
+- `AvatarEngine::invalidateKeepArt()` — no more ~1.3 s eyes-less black hole
+  after teardown/defer.
+
 ## v1.1.0 — device firmware v0.5.29 (2026-10-10)
 
 ### Added

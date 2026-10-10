@@ -953,6 +953,13 @@ void AvatarEngine::invalidate() {
   nextFrameUs_ = 0;
 }
 
+void AvatarEngine::invalidateKeepArt() {
+  forceRender_ = true;   // repaint WITHOUT the requiresFullClear_ full clear:
+  previousLeftBounds_.valid = false;   // the eyes redraw over the panel art
+  previousRightBounds_.valid = false;  // the caller just painted (card/panel)
+  nextFrameUs_ = 0;
+}
+
 void AvatarEngine::scheduleNextBlink(uint32_t nowMs, bool useInitialDelay) {
   const BlinkSettings& blink = spec(targetExpression_).blink;
   blinkStartedMs_ = 0;

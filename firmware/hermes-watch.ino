@@ -57,7 +57,7 @@ static bool s_enrolled = false;         // last-known server truth
 __attribute__((used, section(".rodata")))
 static const char HG_BOARD_TAG[] = "HGBOARD=m5stack-stopwatch";
 __attribute__((used, section(".rodata")))
-static const char HG_VER_TAG[] = "HGVER=0.5.29";
+static const char HG_VER_TAG[] = "HGVER=0.5.30";
 static bool s_connected = false;
 static bool s_paired = false;
 static bool s_turnActive = false;
@@ -513,6 +513,43 @@ static uint32_t s_btnBSuppressMs = 0;          // block PTT re-arm after a
 static uint32_t s_toastUntilMs = 0;            // commit-toast window (H1)
 static bool s_toastShown = false;
 static bool s_cmdArmed = false;  // v0.5.28: 800 ms hold ARMED a two-hold confirm
+// ---- v0.5.30: haptic tick -------------------------------------------------
+// Vibe motor = IoeM5PM1 @0x4F, PWM reg 0x1B, 12-bit duty + enable bit 15
+// (M5Stack official StopWatch UserDemo pattern; main.cpp.device-reference).
+// Probe = the reference's raw M5.In_I2C register write (no M5IOE1 instance
+// needed); vibeTick() runs in loop() to auto-stop; each haptic costs ONE
+// 2-byte I2C write. Silent no-op if the IOE/PWM block isn't present.
+static bool   s_vibeReady = false;
+static uint32_t s_vibeStopsAtMs = 0;
+
+static void vibeStop() {
+  if (!s_vibeReady) return;
+  const uint8_t off[2] = {0, 0x80};
+  M5.In_I2C.writeRegister(0x4F, 0x1B, off, 2, 100000u);
+  s_vibeStopsAtMs = 0;
+}
+
+static void vibrate(uint8_t strength255, uint16_t durationMs) {
+  if (!s_vibeReady) return;
+  const uint32_t duty12 = ((uint32_t)strength255 * 0x0FFFu) / 255u;
+  const uint8_t pwm[2] = {(uint8_t)(duty12 & 0xFF),
+                          (uint8_t)(0x80 | ((duty12 >> 8) & 0x0F))};
+  if (!M5.In_I2C.writeRegister(0x4F, 0x1B, pwm, 2, 100000u)) return;
+  s_vibeStopsAtMs = millis() + durationMs;
+}
+
+static void vibeTick() {
+  if (s_vibeStopsAtMs && (int32_t)(millis() - s_vibeStopsAtMs) >= 0) vibeStop();
+}
+
+static void setupVibration() {
+  // duty 0 + enable bit set = the reference's init state (configured, off);
+  // a successful write doubles as the presence probe.
+  const uint8_t pwm0[2] = {0, 0x80};
+  s_vibeReady = M5.In_I2C.writeRegister(0x4F, 0x1B, pwm0, 2, 100000u);
+  if (!s_vibeReady) Serial.println("[ui] vibration motor not detected");
+}
+
 // ---- v0.5.28: tool-progress ticker (y=318 band; the jarvis 0.8s-feedback win).
 static void eraseTickerCell() { M5.Display.fillRect(48, 315, 370, 22, TFT_BLACK); }
 
@@ -775,11 +812,11 @@ struct AgentProfile {
 // generic here (AGENT 1..5); rename to your own agent identities at this one table
 // (and mirror in sim/include/profile_ring.h).
 static const AgentProfile kProfiles[] = {
-  {"AGENT 1", "",                          0xFFB020u},
+  {"AGENT 1",   "",                          0xFFB020u},
   {"AGENT 2", "Foresight Strategist",      0x9D6BFFu},
-  {"AGENT 3", "Project Engineer",          0x2DD4BFu},
-  {"AGENT 4", "Local Model Agent",         0x4ADE80u},
-  {"AGENT 5", "Product Research",          0xFF5C8Au},
+  {"AGENT 3",   "Project Engineer",          0x2DD4BFu},
+  {"AGENT 4",   "Local Model Agent",         0x4ADE80u},
+  {"AGENT 5",  "Product Research",          0xFF5C8Au},
 };
 static const size_t kProfileCount = sizeof(kProfiles) / sizeof(kProfiles[0]);
 static size_t s_profileIdx = 4;  // committed agent (default AGENT 5)
@@ -981,14 +1018,20 @@ static void promptTeardown(const char *why) {
   s_promptId[0] = 0; s_promptTitle[0] = 0; s_promptText[0] = 0;
   s_promptOpen = false; s_promptCardPainted = false; s_promptPending = false;
   s_promptRepaint = false; s_replyRepaint = false;
+  // v0.5.30: the disc wipe below erased the reply card's pixels too, but a
+  // stale s_replyCardPainted made the eyes slot skip avatar.update() AND the
+  // card repaint — a BLACK panel (no eyes, no card) until the old 12 s timer
+  // expired. Clear it: the arm slot re-paints the still-shown card (with a
+  // fresh timer) on the next pass.
+  s_replyCardPainted = false;
   s_hubWaiting = false; s_promptExpireMs = 0; s_promptTtlMs = 0;
   s_promptHoldLatched = false;
   if (s_screen == SCR_EYES) {
     M5.Display.fillCircle(kCircleC, kCircleC, kCircleR, TFT_BLACK);
-    avatar.invalidate();
-    s_ringState = kRingRedrawAll;
-  } else {
-    s_rebuildScreenId = s_screen;   // the preempted static screen repaints
+    avatar.invalidateKeepArt();   // v0.5.30 (F13): repaint EYES with dirty rects
+    s_ringState = kRingRedrawAll; // only — the old full clear put a ~1.3 s
+  } else {                        // eyes-less hole on the panel after every
+    s_rebuildScreenId = s_screen; // teardown/defer; the ring repaints first.
   }
   s_tickerDirty = true;
 }
@@ -1006,11 +1049,18 @@ static void deferPrompt() {   // "later": hide; re-raise on a timer
   if (!s_promptOpen || !s_promptCardPainted) return;
   s_promptCardPainted = false;
   s_promptPending = true;
+  // v0.5.30 CRITICAL: s_promptOpen stayed true, so the render slot's arm
+  // branch (s_promptOpen && !s_promptCardPainted) re-painted the card on the
+  // very next pass — "HOLD B LATER" blinked and hid nothing, and the +45 s
+  // re-raise then wiped/repainted the already-visible card (double flash).
+  // s_hubWaiting is deliberately left true: WATCHING-ON-USER ring + watchdog
+  // stand-down keep running while the question is parked.
+  s_promptOpen = false;
   s_promptRaiseMs = millis() + 45000;
   if (s_screen == SCR_EYES) {
     M5.Display.fillCircle(kCircleC, kCircleC, kCircleR, TFT_BLACK);
-    avatar.invalidate();
-    s_ringState = kRingRedrawAll;
+    avatar.invalidateKeepArt();   // v0.5.30 (F13): eyes back with dirty rects,
+    s_ringState = kRingRedrawAll; // no full-clear hole after "later"
   } else {
     s_rebuildScreenId = s_screen;
   }
@@ -1023,91 +1073,180 @@ static void drawPromptCard() {
   auto &d = M5.Display;
   d.fillCircle(kCircleC, kCircleC, 180, 0x0A0A12u);
   d.drawCircle(kCircleC, kCircleC, 196, kPromptCol);
-  // v0.5.29 (F2): the card owns the WHOLE panel — clear the stale ring
-  // annulus (205..230) + the y=340 label band a pre-card state left behind;
-  // their painters are unreached while the card is up.
-  d.drawArc(kCircleC, kCircleC, 205, 230, 0, 360, TFT_BLACK);
-  d.fillRect(93, 339, 280, 17, TFT_BLACK);
-  eraseStatusLine();   // the card owns the panel: bands go idle-black
-  eraseTickerCell();
-  eraseDeltaStrip();
-  s_deltaLive = false; s_deltaDirty = false;
+  // v0.5.30 (F9): ring/band wipes live in the card ARM slot (loop, once per
+  // show); the body paints only the card art — a TTL-expiry repaint or
+  // re-show can't re-blast the bands (and the arc wipe) every pass.
   uiText("APPROVAL", 92, &fonts::FreeSansBold12pt7b, kPromptCol, 0x0A0A12u);
-  {  // title at 18pt; 27 caps ≈ 364 px ≤ chord@152 (~424)
-    char t18[28];
-    strlcpy(t18, s_promptTitle, sizeof(t18));
-    uiText(t18, 152, &fonts::FreeSans18pt7b, TFT_WHITE, 0x0A0A12u);
+  {  // title at 18pt; wrapped to 2 rows of <=16 chars (27 caps = 364 px, one
+     // row CLIPPED both sides at y 152..181 / chord ~291; FreeSans18pt caps
+     // average 18 px). v0.5.30: word-wrap once on a space; overflow with no
+     // break space falls back to 9pt (legible, never clipped).
+    char r0[18], r1[18];
+    {
+      const char *s = s_promptTitle;
+      uint8_t tl = 0;
+      while (s[tl] && tl < 16) ++tl;
+      if (s[tl]) {                      // overflow: find a space to break on
+        uint8_t b = tl;
+        while (b > 4 && s[b] != ' ') --b;
+        if (s[b] == ' ') tl = b;
+      }
+      memcpy(r0, s, tl); r0[tl] = 0;
+      const char *s2 = s + tl;
+      if (*s2 == ' ') ++s2;             // swallow the break space
+      uint8_t l2 = 0;
+      while (s2[l2] && l2 < 16) ++l2;
+      memcpy(r1, s2, l2); r1[l2] = 0;
+    }
+    auto titleRow = [&](const char *s, int16_t y) {
+      if (strlen(s) > 16)               // long/no-space title: 9pt fallback
+        uiText(s, y, &fonts::FreeSans9pt7b, TFT_WHITE, 0x0A0A12u);
+      else
+        uiText(s, y, &fonts::FreeSans18pt7b, TFT_WHITE, 0x0A0A12u);
+    };
+    titleRow(r0, 148);
+    if (r1[0]) titleRow(r1, 176);   // 2nd title row ends y~194; body y=196 ok
   }
+  // v0.5.30 F8: 27-char rows at 9pt up to ~238 px (FreeSans caps ~9 px,
+  // lowercase ~6) can spill past the chord (~190 px side-half at the 3rd body
+  // row) into the ring — cap the max row at 30 chars (~183 px worst).
   {  // body: up to 4 x 9pt rows, wrapped on spaces
     char row[40];
     int src = 0;
     for (int r = 0; r < 4 && s_promptText[src]; ++r) {
       const int16_t rowY = 196 + 18 * r;
       int n = 0;
-      while (s_promptText[src + n] && n < 36) ++n;
-      if (s_promptText[src + n]) {
+      // v0.5.30: bound ALL scans by the 160-char text buffer (a long
+      // prompt whose last line has no spaces overran char 60 into the
+      // title's 64-byte buffer — 4 'ghost title' rows on the live card).
+      while (src + n < 160 && s_promptText[src + n] && n < 30) ++n;
+      if (s_promptText[src + n] && src + n < 160) {
         int b = n;
         while (b > 12 && s_promptText[src + b] != ' ') --b;
         if (b > 12) n = b;
       }
       memcpy(row, s_promptText + src, n); row[n] = 0;
-      src += s_promptText[src + n] ? n + 1 : n;
+      src += (s_promptText[src + n] && src + n < 160) ? n + 1 : n;
       uiText(row, rowY, &fonts::FreeSans9pt7b, 0x9AA3ADu, 0x0A0A12u);
     }
   }
-  uiText("A YES", 320, &fonts::FreeSans18pt7b, TFT_WHITE, 0x0A0A12u,
-         lgfx::v1::textdatum_t::top_left, 90);
-  uiText("B NO", 320, &fonts::FreeSans18pt7b, 0xC9CFD6u, 0x0A0A12u,
-         lgfx::v1::textdatum_t::top_left, 250);
+  // v0.5.30 F7: A/B glyphs were set to 18pt — 'A YES' 18pt ~78 px spans
+  // x 90..168 while the chord at ink rows 321..348 is ~254 px (x 106..360):
+  // the 'A' corner sits ~16 px PAST the chord, clipped by the dead corner.
+  // 12pt bold (~60 px, ink to y 346) + pulled in to x=106: fully inside.
+  uiText("A YES", 322, &fonts::FreeSansBold12pt7b, kPromptCol, 0x0A0A12u,
+         lgfx::v1::textdatum_t::top_left, 106);
+  // 12pt 'B NO' ~40 px pinned at the chord edge (right ~356): fixes both the
+  // old 18pt row-drift and the off-center pair (was fixed x=250, gaps 82/176).
+  uiText("B NO", 322, &fonts::FreeSansBold12pt7b, 0xC9CFD6u, 0x0A0A12u,
+         lgfx::v1::textdatum_t::top_left, 316);
   uiText("CLICK ANSWER - HOLD B LATER", 402, &fonts::FreeSans9pt7b,
          0x5A6470u, TFT_BLACK);
 }
 
-// ---- v0.5.28: REPLY CARD — the readable answer. 9pt x 8 rows x 34 chars,
-// 272 chars/page + page tag. A=dismiss, B=page (last page falls to follow-up).
+// ---- v0.5.28/30: reply text paging -----------------------------------------
+// v0.5.30 (F11): pages were fixed 272-char strides while the word-wrap
+// consumes VARIABLE chars per row (a break-at-space row eats < 34) — up to
+// ~24 chars of every wrapped page's tail was silently SKIPPED on multi-page
+// replies (dropped words mid-answer). Pages are now derived from the wrap
+// itself (deterministic), recomputed on every reply/delta text change.
+// v0.5.30 (F10): the page renders 3 HEADLINE rows at TrueType 24pt bold
+// (chars ≤12, glanceable at arm's length) + 4 continuation rows at 9pt.
+static constexpr size_t   kReplyHeadCap = 12;   // chars per 24pt row
+static constexpr size_t   kReplyRowCap  = 34;   // chars per 9pt row
+static constexpr uint8_t  kReplyRows    = 7;    // 3 headline + 4 continuation
+static uint16_t s_replyOff[10];   // start offset of page i
+static uint8_t  s_replyPages = 1;
+
+static void buildReplyPages() {
+  size_t p = 0;
+  uint8_t pg = 0;
+  s_replyOff[0] = 0;
+  while (pg < 9) {
+    size_t used = 0;
+    for (uint8_t r = 0; r < kReplyRows && p + used < s_replyLen; ++r) {
+      const size_t cap = r < 3 ? kReplyHeadCap : kReplyRowCap;
+      const size_t minKeep = r < 3 ? 4u : 10u;
+      size_t n = 0;
+      while (p + used + n < s_replyLen && n < cap) ++n;
+      if (p + used + n < s_replyLen) {
+        size_t b = n;
+        while (b > minKeep && s_replyText[p + used + b] != ' ') --b;
+        if (b > minKeep) n = b;
+      }
+      used += n;
+    }
+    ++pg;
+    if (p + used >= s_replyLen || pg >= 10) break;
+    s_replyOff[pg] = (uint16_t)(p + used);
+    p += used;
+  }
+  s_replyPages = pg ? pg : 1;
+}
+
+// ---- v0.5.28: REPLY CARD — the readable answer. A=dismiss, B=page
+// (last page falls to follow-up).
 static void drawReplyCard() {
   auto &d = M5.Display;
   const uint32_t accent = committedProfile().color;
   d.fillCircle(kCircleC, kCircleC, 180, 0x0A0A12u);
   d.drawCircle(kCircleC, kCircleC, 196, accent);
-  // v0.5.29 (F2): same panel ownership as the prompt card — a pre-card
-  // THINKING/SPEAKING ring arc + its y=340 label survived the card paint
-  // before (the 'overlay lines over the ring').
-  d.drawArc(kCircleC, kCircleC, 205, 230, 0, 360, TFT_BLACK);
-  d.fillRect(93, 339, 280, 17, TFT_BLACK);
-  eraseStatusLine();
-  eraseTickerCell();
-  eraseDeltaStrip();
-  s_deltaLive = false; s_deltaDirty = false;
-  constexpr size_t kPerPage = 272;   // 34 chars x 8 rows
-  const uint8_t pages = (uint8_t)((s_replyLen + kPerPage - 1) / kPerPage);
+  // v0.5.30 (F9): the ring/band wipes moved into the card ARM slot (loop(),
+  // once per show/flip) — drawReplyCard no longer re-wipes bands during
+  // repaints (live-delta updates) so delta frames can't punch black holes
+  // around the ring arc while text redraws 60×/s... and the per-redraw fill
+  // count halves (SPI budget).
+  const uint8_t pages = s_replyPages;
   char tag[16];
   snprintf(tag, sizeof(tag), "%u/%u", (unsigned)(s_replyPage + 1),
            (unsigned)(pages ? pages : 1));
   uiText("REPLY", 92, &fonts::FreeSansBold12pt7b, accent, 0x0A0A12u);
+  // v0.5.30 F5: page tag drawn top_right at x=354 — a '10/10' tag drawn
+  // top_left at the old fixed 330 spanned to x~366 (past the SAFE chord
+  // 174 at y 95..107). Right-pinned: self-compacts, never crosses the ring.
   uiText(tag, 94, &fonts::FreeSans9pt7b, 0x5A6470u, 0x0A0A12u,
-         lgfx::v1::textdatum_t::top_left, 330);
-  size_t src = (size_t)s_replyPage * kPerPage;
-  for (int r = 0; r < 8; ++r) {
+         lgfx::v1::textdatum_t::top_right, 354);
+  // v0.5.30 (F10): 3 headline rows at TrueType 24pt bold + 4 continuation
+  // rows at 9pt — the page is now READABLE at arm's length (the old 8x34
+  // wall of 9pt was fine print). Rows consume from the page's own start
+  // offset (F11: exact pagination — old fixed 272-char strides dropped up
+  // to ~24 chars per wrapped page).
+  size_t src = s_replyOff[s_replyPage < 10 ? s_replyPage : 0];
+  for (int r = 0; r < 7; ++r) {
     if (src >= s_replyLen) break;
-    const int16_t rowY = 140 + 19 * r;
+    const size_t cap = (r < 3) ? kReplyHeadCap : kReplyRowCap;
+    const size_t minKeep = (r < 3) ? 4u : 10u;
+    const int16_t rowY = 116 + 21 * r;
     size_t n = 0;
-    while (s_replyText[src + n] && n < 34) ++n;
+    while (s_replyText[src + n] && n < cap) ++n;
     if (s_replyText[src + n]) {
       size_t b = n;
-      while (b > 10 && s_replyText[src + b] != ' ') --b;
-      if (b > 10) n = b;
+      while (b > minKeep && s_replyText[src + b] != ' ') --b;
+      if (b > minKeep) n = b;
     }
     char row[36];
     memcpy(row, s_replyText + src, n); row[n] = 0;
     const char *draw = row;
     if (r > 0 && row[0] == ' ') draw = row + 1;
-    uiText(draw, rowY, &fonts::FreeSans9pt7b, TFT_WHITE, 0x0A0A12u);
+    const uint32_t ink = (r < 3) ? 0x00E5FFu : TFT_WHITE;
+    if (r < 3)
+      uiText(draw, rowY, &fonts::FreeSansBold24pt7b, ink, 0x0A0A12u);
+    else
+      uiText(draw, rowY, &fonts::FreeSans9pt7b, ink, 0x0A0A12u);
     src += n;
   }
-  uiText(pages > (uint8_t)(s_replyPage + 1) ? "CLICK B NEXT PAGE"
-         : "A DISMISS - HOLD B TALK", 320, &fonts::FreeSans9pt7b,
-         0x5A6470u, 0x0A0A12u);
+  // v0.5.30 F9b: the two 9pt hints collided at y=320 (mid-reply
+  // 'CLICK B NEXT PAGE' and last-page 'A DISMISS - HOLD B TALK' overpainted
+  // each other at a page flip); they now split top/bottom (320 / 402),
+  // mirroring the card row-band structure.
+  if (pages > (uint8_t)(s_replyPage + 1)) {
+    uiText("CLICK B NEXT PAGE", 320, &fonts::FreeSans9pt7b,
+           0x5A6470u, 0x0A0A12u);
+    uiText("A DISMISS", 402, &fonts::FreeSans9pt7b, 0x5A6470u, TFT_BLACK);
+  } else {
+    uiText("A DISMISS - HOLD B TALK", 320, &fonts::FreeSans9pt7b,
+           0x5A6470u, 0x0A0A12u);
+  }
 }
 
 // ---- SCR_AGENTS: static screen (painted on entry / change only) ------------
@@ -1342,9 +1481,13 @@ static void handleButtons(uint32_t nowMs) {
   }
   // v0.5.28: a card that owns the eyes screen hijacks BtnA/BtnB for its lifetime.
   if (s_screen == SCR_EYES && s_promptCardPainted) {
-    if (M5.BtnA.wasClicked()) { answerPrompt(true); return; }
+    if (M5.BtnA.wasClicked()) { vibrate(8, 50); answerPrompt(true); return; }
     if (M5.BtnB.wasClicked() && !s_promptHoldLatched &&
-        nowMs - btnBHoldEndMs > 100) { answerPrompt(false); return; }
+        nowMs - btnBHoldEndMs > 100) {
+      vibrate(8, 50);
+      answerPrompt(false);
+      return;
+    }
     if (M5.BtnB.isPressed() && !s_promptHoldLatched && M5.BtnB.pressedFor(800)) {
       s_promptHoldLatched = true;
       deferPrompt();
@@ -1355,8 +1498,7 @@ static void handleButtons(uint32_t nowMs) {
     return;
   }
   if (s_screen == SCR_EYES && s_replyCardShown) {
-    constexpr size_t kPerPage = 272;
-    const uint8_t pages = (uint8_t)((s_replyLen + kPerPage - 1) / kPerPage);
+    const uint8_t pages = s_replyPages;
     const bool lastPage = pages <= (uint8_t)(s_replyPage + 1);
     if (M5.BtnB.wasClicked() && !s_replyHoldLatched &&
         nowMs - btnBHoldEndMs > 100 && !lastPage) {
@@ -1364,6 +1506,7 @@ static void handleButtons(uint32_t nowMs) {
       s_replyCardPainted = false;
       s_replyRepaint = true;   // v0.5.29: page flip = one repaint
       s_replyCardUntilMs = millis() + 12000;
+      vibrate(6, 40);   // v0.5.30: page-advance tick
       return;
     }
     if (lastPage && M5.BtnB.isPressed() && !s_replyHoldLatched &&
@@ -1373,7 +1516,8 @@ static void handleButtons(uint32_t nowMs) {
       M5.Display.fillCircle(kCircleC, kCircleC, kCircleR, TFT_BLACK);
       avatar.invalidate(); s_ringState = kRingRedrawAll;
       s_btnBSuppressMs = millis();  // v0.5.29 (F3): H2 — swallow the hold's
-      voiceStartListening(true);    // release tail (phantom PTT guard)
+      vibrate(6, 24);               // release tail (phantom PTT guard)
+      voiceStartListening(true);
       return;
     }
     if (!M5.BtnB.isPressed() && s_replyHoldLatched) {
@@ -1691,8 +1835,28 @@ void dispatchJson(const char *rx, size_t len) {
 
   // v0.5.28: hub prompt = the approval/question the wrist must answer
   // (hub ask() → slash-confirms, exec approvals, Hermes confirmations).
-  if (strstr(buf, "\"type\":\"prompt\"")) {
-    const char *idK = strstr(rx, "\"id\":\"");
+  // v0.5.30 (F12): the bare "prompt" match also catches "prompt.close" —
+  // but prompt.close is HANDLED FURTHER DOWN, so a real close frame is
+  // consumed here with NO id present → the local card is never torn down
+  // and stays up forever after the hub withdrew the question. Order the
+  // checks: match close FIRST (it's the longer token, and strstr on the
+  // compacted buf guarantees the close tail is intact).
+  {
+    const char *tRaw = strstr(buf, "\"type\":\"");
+    const char *tpEnd = tRaw ? strchr(tRaw + 8, '"') : nullptr;
+    size_t tLen = tpEnd ? (size_t)(tpEnd - (tRaw + 8)) : 0;
+    const bool isPrompt =
+        tRaw && tpEnd &&
+        ((tLen == 6 && !memcmp(tRaw + 8, "prompt", 6)) ||
+         (tLen == 12 && !memcmp(tRaw + 8, "prompt.close", 12)));
+    if (isPrompt) {
+      const bool isClose = (tLen == 12);
+      if (isClose) {
+        // withdrawal (hub re-shows with a new frame when it re-asks): clear ours.
+        promptTeardown("closed by hub");
+        return;
+      }
+      const char *idK = strstr(rx, "\"id\":\"");
     if (idK) {
       idK += 6;
       const char *end = strchr(idK, '"');
@@ -1714,6 +1878,12 @@ void dispatchJson(const char *rx, size_t len) {
         s_promptHoldLatched = false;
         s_promptCardPainted = false;   // painted on the next loop pass
   s_promptRepaint = true;        // v0.5.29: one full paint, then frozen
+        // v0.5.30: fresh prompt preempts the reply card + kills its live
+        // keep-alive (the reply slot sits behind the prompt arm — priority).
+        s_replyCardShown = false;
+        s_replyCardPainted = false;
+        s_replyCardUntilMs = 0;
+        s_replyAutoPending = false;
         s_hubWaiting = true;           // watchdogs stand down while he decides
         V.lastHubMs = millis();        // the prompt IS turn traffic
         s_lastTurnFrameMs = millis();
@@ -1724,11 +1894,7 @@ void dispatchJson(const char *rx, size_t len) {
     }
     return;
   }
-  if (strstr(buf, "\"type\":\"prompt.close\"")) {
-    // withdrawal (hub re-shows with a new frame when it re-asks): clear ours.
-    promptTeardown("closed by hub");
-    return;
-  }
+  }  // end v0.5.30 prompt / prompt.close dispatch block
 
   // ---- turn lifecycle
   s_lastTurnFrameMs = millis();  // v0.5.27: ping returns above — pings never count here
@@ -1767,6 +1933,20 @@ void dispatchJson(const char *rx, size_t len) {
       drawStatusLineCol(band, 0x9AA3ADu);
     }
     return;
+  }
+  // v0.5.30: reply card = LAST-SEEN state. The hub streams the LIVE delta while
+  // the voice reads the answer; when the user glances at the card it must show
+  // what the hub is saying NOW, not the stale full-re frame from 20 s ago.
+  if (strstr(buf, "\"type\":\"reply.delta\"") && s_replyCardShown) {
+    const int dl = jsonExtractString(rx, "\"text\":\"", s_replyText,
+                                     sizeof(s_replyText));
+    if (dl > 0) {
+      s_replyLen = (size_t)dl;
+      buildReplyPages();                      // exact pagination for new text
+      if (s_replyPage + 1 > s_replyPages) s_replyPage = 0;
+      s_replyCardUntilMs = millis() + 12000;  // live activity = keep the card alive
+      s_replyRepaint = s_replyCardPainted;    // repaint ONCE per delta batch
+    }
   }
   if (strstr(buf, "\"type\":\"reply.delta\"")) {
     setStateFromServer("reply.delta");
@@ -1815,6 +1995,11 @@ void dispatchJson(const char *rx, size_t len) {
     const int rl = jsonExtractString(rx, "\"text\":\"", s_replyText, sizeof(s_replyText));
     s_replyLen = rl > 0 ? (size_t)rl : 0;
     s_replyPage = 0;
+    buildReplyPages();   // v0.5.30: exact pagination from the text + wrap
+    // v0.5.30: card ALREADY up (a reply arrived while reading, or the auto-show
+    // raced us): keep it shown — overwriting the flag false would leave a
+    // painted card with no state (timers dead, buttons dead).
+    s_replyCardShown = s_replyCardShown || s_replyLen > 0;
     s_replyAutoPending = s_replyLen > 0;   // card shows once audio drains
     char msg[121];
     strlcpy(msg, s_replyText, sizeof(msg));
@@ -2006,6 +2191,10 @@ void setup() {
   M5.Touch.setHoldThresh(650);
   M5.Touch.setFlickThresh(10);
 
+  // v0.5.30: vibe motor probe (IoeM5PM1 @0x4F) — haptic ticks for prompt
+  // answers; silent no-op everywhere if the IOE driver doesn't come up.
+  setupVibration();
+
   // Speaker loudness: M5Unified default master_volume=64 → amplitude scaled
   // to ~6% ((64²)/(255²)) — the 'extremely quiet' bug. UserDemo runs 80-100
   // into the same ES8311 DAC register (0x32=0xEF / −6 dB ceiling).
@@ -2100,6 +2289,7 @@ void setup() {
 void loop() {
   M5.update();
   const uint32_t nowMs = millis();
+  vibeTick();   // v0.5.30: end the haptic pulse when its window expires
 
   // WiFi maintain
   if (WiFi.status() != WL_CONNECTED) {
@@ -2327,6 +2517,14 @@ void loop() {
     s_promptOpen = true;
     s_promptCardPainted = false;
     s_promptRepaint = true;
+    // v0.5.30: a prompt outranks the reply card AND its live keep-alive: the
+    // render chain's prompt slot sits behind the reply card, so an up card
+    // would starve the prompt arm. Drop the reply (state + timeout) and kill
+    // the armed-prompt's fresh-delta keep-alive — priority is prompt.
+    s_replyCardShown = false;
+    s_replyCardPainted = false;
+    s_replyCardUntilMs = 0;
+    s_replyAutoPending = false;
     if (s_screen != SCR_EYES) gotoScreen(SCR_EYES);  // card preempts any screen
     s_ringState = kRingRedrawAll;
     hubXlog("prompt", "re-raised");
@@ -2409,13 +2607,35 @@ void loop() {
         // outside r196 like the commit toast.
         s_promptCardPainted = true;
         M5.Display.fillCircle(kCircleC, kCircleC, kCircleR, TFT_BLACK);
-        avatar.invalidate();
+        // v0.5.30 (F9/F6): the card owns the WHOLE panel — wipe the ring
+        // annulus + status/delta/label bands HERE, once per show (was in the
+        // draw body: SPI theft per repaint + band re-flash under the ring).
+        // Flag-reset matters: s_deltaLive left true makes the delta painter
+        // repaint the strip around the card disc mid-stream.
+        M5.Display.drawArc(kCircleC, kCircleC, 205, 230, 0, 360, TFT_BLACK);
+        M5.Display.fillRect(93, 339, 280, 17, TFT_BLACK);
+        eraseStatusLine();
+        eraseDeltaStrip();
+        s_deltaLive = false; s_deltaDirty = false;
+        avatar.invalidateKeepArt();   // v0.5.30 (F13): no stale-eyes wipe on
+                                      // re-show; eyes return via dirty rects
         s_promptRepaint = true;   // v0.5.29: paint once in the slot below
         s_ringState = kRingRedrawAll;
       } else if (s_replyCardShown && !s_replyCardPainted) {
         // v0.5.28: the readable reply card — same preempt pattern.
         s_replyCardPainted = true;
         M5.Display.fillCircle(kCircleC, kCircleC, kCircleR, TFT_BLACK);
+        // v0.5.30 (F9/F6): full panel ownership, once per show/page-flip —
+        // ring annulus + status/delta/label/ticker bands wiped here so the
+        // card body can repaint (live-delta updates) without re-blasting
+        // bands or erasing its own text mid-stream.
+        M5.Display.drawArc(kCircleC, kCircleC, 205, 230, 0, 360, TFT_BLACK);
+        M5.Display.fillRect(93, 339, 280, 17, TFT_BLACK);
+        eraseStatusLine();
+        eraseTickerCell();
+        eraseDeltaStrip();
+        s_deltaLive = false; s_deltaDirty = false;
+        s_tickerLive = false; s_tickerDirty = false;
         avatar.invalidate();
         drawReplyCard();
         s_ringState = kRingRedrawAll;

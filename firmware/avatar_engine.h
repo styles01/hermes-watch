@@ -113,7 +113,10 @@ class AvatarEngine {
   void setTiltTarget(float normalizedX, float normalizedY,
                      float motionLeadX = 0.0f, float motionLeadY = 0.0f);
   void setShakeTarget(float normalizedX, float normalizedY, float intensity);
-  void invalidate();
+  void invalidate();     // forceRender + full clear (full repaint next update)
+  void invalidateKeepArt();  // v0.5.30: force a repaint WITHOUT the full clear —
+                             // re-paints the eyes over new background art
+                             // (cards/panels) without erasing it first
 
   void setBaseFace(ExpressionId expression) {  // v0.5.11: held (loop-forced) resting face
     if (ready_) baseExpression_ = expression;

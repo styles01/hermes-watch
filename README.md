@@ -143,8 +143,11 @@ the image once it's reached the hub (automatic rollback otherwise). [docs/OTA.md
 approval cards, reply cards, tool ticker, OTA self-updates. In active development;
 visual polish of the card UX is the current lane.
 
-Grab the prebuilt binary on the [Releases](../../releases) page (v1.1.0 ships the
-v0.5.29 app image — OTA or USB both work; see [docs/OTA.md](docs/OTA.md)).
+Grab the prebuilt binaries on the [Releases](../../releases) page — the
+**app image** (.bin at 0x10000, for OTA / esptool) AND the
+**M5Stack loader image** (`*-m5stack-loader.bin`, full 16 MB flash incl. bootloader +
+partition table — one file, any ESP32 flash tool, M5Burner-style). OTA guide:
+[docs/OTA.md](docs/OTA.md).
 
 ## Credits
 
