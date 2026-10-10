@@ -24,8 +24,16 @@ updates itself over the air.
 
 <div align="center">
 
+![Hermes Watch — thinking avatar + agent selector (simulator render)](docs/hero-sim.png)
+
+*What it renders: procedural avatar mid-turn, five-agent selector. **Simulator pixels** — the left screen is the real KK avatar engine capture; the agents screen is re-rendered 1:1 from the firmware's draw code.*
+
+</div>
+
+<div align="center">
+
 ![Hermes Watch on the bench — glowing eyes + green status ring](docs/hero.jpg)
-*The build, live on the bench: procedural avatar eyes + state-coded status ring.*
+*The build, live on the bench: the same face, glowing green state ring and all.*
 
 </div>
 
