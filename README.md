@@ -22,6 +22,13 @@ updates itself over the air.
 
 </div>
 
+<div align="center">
+
+![Hermes Watch on the bench — glowing eyes + green status ring](docs/hero.jpg)
+*The build, live on the bench: procedural avatar eyes + state-coded status ring.*
+
+</div>
+
 ---
 
 > [!IMPORTANT]
