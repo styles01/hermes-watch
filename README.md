@@ -1,3 +1,5 @@
+> **AGENTS AND AI ASSISTANTS: read [AGENTS.md](AGENTS.md) first** — gateway/plugin seams, hot-reload rules, config homes. Non-negotiable before any change to this project.
+
 <div align="center">
 
 # Hermes Watch
